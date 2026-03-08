@@ -6,13 +6,16 @@ set -euo pipefail
 GROUP_ROOT="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATE_DIR="$GROUP_ROOT/templates/garden"
 COORDINATOR_DIR="$GROUP_ROOT/coordinator"
+SETUP_DIR="${1:-$GROUP_ROOT/../setup}"
+SETUP_DIR="$(cd "$SETUP_DIR" 2>/dev/null && pwd || echo "$SETUP_DIR")"
 
 die() { echo "personalagentkit-genesis: $*" >&2; exit 1; }
 
 # 1. Verification
 echo "── PersonalAgentKit Genesis ────────────────────────────────────────────────"
 [[ -d "$TEMPLATE_DIR" ]] || die "template directory not found: $TEMPLATE_DIR"
-[[ -f "$GROUP_ROOT/shared/charter.md" ]] || die "shared/charter.md not found — please create it first"
+[[ -d "$SETUP_DIR" ]] || die "setup directory not found: $SETUP_DIR — create it with charter.md and optionally secrets/, or pass path as argument"
+[[ -f "$SETUP_DIR/charter.md" ]] || die "charter.md not found in $SETUP_DIR — please create it first"
 
 if [[ -d "$COORDINATOR_DIR" ]]; then
   echo "Coordinator garden already exists at $COORDINATOR_DIR"
@@ -27,6 +30,18 @@ echo "Bootstrapping coordinator garden..."
 mkdir -p "$COORDINATOR_DIR"
 cp -r "$TEMPLATE_DIR"/* "$COORDINATOR_DIR"/
 cp "$TEMPLATE_DIR"/.gitignore "$COORDINATOR_DIR"/ 2>/dev/null || true
+
+# Place charter into shared/
+mkdir -p "$GROUP_ROOT/shared"
+cp "$SETUP_DIR/charter.md" "$GROUP_ROOT/shared/charter.md"
+echo "Installed charter → shared/charter.md"
+
+# Place secrets into coordinator/secrets/
+if [[ -d "$SETUP_DIR/secrets" ]] && [[ -n "$(ls -A "$SETUP_DIR/secrets" 2>/dev/null)" ]]; then
+  mkdir -p "$COORDINATOR_DIR/secrets"
+  cp -r "$SETUP_DIR/secrets"/* "$COORDINATOR_DIR/secrets"/
+  echo "Installed secrets → coordinator/secrets/"
+fi
 
 # Use the scrubbed coordinator-terroir.md example as the default terroir
 if [[ -f "$GROUP_ROOT/examples/coordinator-terroir.md" ]]; then

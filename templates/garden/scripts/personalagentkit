@@ -38,6 +38,33 @@ iso_now() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+iso_to_epoch() {
+  # Convert ISO 8601 timestamp to epoch seconds (portable: BSD + GNU)
+  local ts="$1"
+  date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" "+%s" 2>/dev/null \
+    || date -u -d "$ts" "+%s" 2>/dev/null \
+    || echo 0
+}
+
+# ── driver config ─────────────────────────────────────────────────────────────
+
+PAK_DRIVER="${PAK_DRIVER:-claude}"
+PAK_MODEL="${PAK_MODEL:-}"
+
+case "$PAK_DRIVER" in
+  claude)
+    _driver_bin="claude"
+    _driver_model="${PAK_MODEL:-claude-sonnet-4-6}"
+    ;;
+  codex)
+    _driver_bin="codex"
+    _driver_model="${PAK_MODEL:-gpt-5.4}"
+    ;;
+  *)
+    die "unknown driver: $PAK_DRIVER (supported: claude, codex)"
+    ;;
+esac
+
 goal_id_from_file() {
   # goals/001-bootstrap.md → 001-bootstrap
   basename "$1" .md
@@ -103,15 +130,26 @@ invoke_agent() {
   local prompt="$2"
   local events_file="$run_dir/events.jsonl"
 
-  # Start claude in background, streaming NDJSON events to events.jsonl
-  # --verbose is required for --output-format stream-json with --print
-  echo "$prompt" | CLAUDECODE="" claude \
-        --model claude-sonnet-4-6 \
-        --output-format stream-json \
-        --verbose \
-        --dangerously-skip-permissions \
-        >> "$events_file" \
-        2>"$run_dir/stderr.txt" &
+  # Start agent in background, streaming events to events.jsonl
+  case "$PAK_DRIVER" in
+    claude)
+      echo "$prompt" | CLAUDECODE="" claude \
+            --model "$_driver_model" \
+            --output-format stream-json \
+            --verbose \
+            --dangerously-skip-permissions \
+            >> "$events_file" \
+            2>"$run_dir/stderr.txt" &
+      ;;
+    codex)
+      codex exec - \
+            ${_driver_model:+--model "$_driver_model"} \
+            --dangerously-bypass-approvals-and-sandbox \
+            --json \
+            <<< "$prompt" \
+            >> "$events_file" 2>"$run_dir/stderr.txt" &
+      ;;
+  esac
   local claude_pid=$!
 
   # No-event watchdog: kills claude if no new events for 600s (10 minutes)
@@ -156,14 +194,63 @@ invoke_agent() {
   fi
 
   # Extract text output from the result event
-  local result_line
-  result_line=$(grep '"type":"result"' "$events_file" 2>/dev/null | tail -1)
-  if [[ -n "$result_line" ]]; then
-    echo "$result_line" | jq -r '.result // "no output"' > "$run_dir/output.md" 2>/dev/null \
-      || echo "no output" > "$run_dir/output.md"
-  else
-    echo "no output" > "$run_dir/output.md"
-  fi
+  case "$PAK_DRIVER" in
+    claude)
+      local result_line
+      result_line=$(grep '"type":"result"' "$events_file" 2>/dev/null | tail -1)
+      if [[ -n "$result_line" ]]; then
+        echo "$result_line" | jq -r '.result // "no output"' > "$run_dir/output.md" 2>/dev/null \
+          || echo "no output" > "$run_dir/output.md"
+      else
+        echo "no output" > "$run_dir/output.md"
+      fi
+      ;;
+    codex)
+      # Codex: extract last item.completed with agent_message type
+      # agent_message items have a flat .item.text field (not a content array)
+      local codex_output
+      codex_output=$(grep '"type":"item.completed"' "$events_file" 2>/dev/null \
+        | grep '"agent_message"' \
+        | tail -1 \
+        | jq -r '.item.text // "no output"' 2>/dev/null || true)
+      echo "${codex_output:-no output}" > "$run_dir/output.md"
+      ;;
+  esac
+}
+
+# ── cost extraction ────────────────────────────────────────────────────────────
+#
+# extract_cost <events_file>
+#   Sets: input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
+#
+extract_cost() {
+  local events_file="$1"
+  case "$PAK_DRIVER" in
+    claude)
+      local result_event
+      result_event=$(grep '"type":"result"' "$events_file" 2>/dev/null | tail -1 || true)
+      input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
+      output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
+      cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
+      cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
+      cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
+      num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
+      duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
+      ;;
+    codex)
+      # Sum usage across turn.completed events; no cache_write or cost_usd fields
+      input_tokens=$(grep '"type":"turn.completed"' "$events_file" 2>/dev/null \
+        | jq -s '[.[].usage.input_tokens // 0] | add // 0' 2>/dev/null || echo 0)
+      output_tokens=$(grep '"type":"turn.completed"' "$events_file" 2>/dev/null \
+        | jq -s '[.[].usage.output_tokens // 0] | add // 0' 2>/dev/null || echo 0)
+      cache_read=$(grep '"type":"turn.completed"' "$events_file" 2>/dev/null \
+        | jq -s '[.[].usage.cached_input_tokens // 0] | add // 0' 2>/dev/null || echo 0)
+      cache_write=0
+      cost_usd=0
+      num_turns=$(grep -c '"type":"turn.completed"' "$events_file" 2>/dev/null || echo 0)
+      duration_ms=null
+      ;;
+  esac
 }
 
 # ── subcommands ───────────────────────────────────────────────────────────────
@@ -173,7 +260,7 @@ cmd_run() {
   [[ -n "$goal_file" ]] || die "usage: personalagentkit run <goal-file>"
   [[ -f "$REPO_ROOT/$goal_file" ]] || die "goal file not found: $goal_file"
 
-  require claude
+  require "$_driver_bin"
   require jq
 
   local goal_id
@@ -193,7 +280,7 @@ cmd_run() {
     --arg run_id       "$goal_id" \
     --arg goal_file    "$goal_file" \
     --arg started      "$started_at" \
-    --arg agent        "claude-sonnet-4-6" \
+    --arg agent        "${_driver_model:-$PAK_DRIVER}" \
     --arg submitted_by "$submitted_by" \
     '{
       run_id:     $run_id,
@@ -259,17 +346,9 @@ PROMPT
   local completed_at
   completed_at=$(iso_now)
 
-  # ── extract cost from stream result event (P6: cost is always visible) ────
-  local result_event
-  result_event=$(grep '"type":"result"' "$run_dir/events.jsonl" 2>/dev/null | tail -1 || true)
+  # ── extract cost from stream events (P6: cost is always visible) ─────────
   local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
-  input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
-  output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
-  cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
-  cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
-  cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
-  num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
-  duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
+  extract_cost "$run_dir/events.jsonl"
 
   # ── update meta.json with completion data ─────────────────────────────────
   local outputs='["output.md"]'
@@ -368,7 +447,7 @@ cmd_status() {
     started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
 
     local started_epoch elapsed em es
-    started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" "+%s" 2>/dev/null || echo 0)
+    started_epoch=$(iso_to_epoch "$started_at")
     elapsed=$(( now_epoch - started_epoch ))
     em=$(( elapsed / 60 ))
     es=$(( elapsed % 60 ))
@@ -447,7 +526,7 @@ cmd_status() {
     local status_fmt
     if [[ "$status_raw" == "running" && "$started_at" != "null" ]]; then
       local started_epoch elapsed
-      started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" "+%s" 2>/dev/null || echo 0)
+      started_epoch=$(iso_to_epoch "$started_at")
       elapsed=$(( now_epoch - started_epoch ))
       if (( elapsed > 7200 )); then
         status_fmt="stale"
@@ -470,7 +549,7 @@ cmd_plant() {
   [[ -n "$seed_name" ]]  || die "usage: personalagentkit plant <seed-name> <plant-name>"
   [[ -n "$plant_name" ]] || die "usage: personalagentkit plant <seed-name> <plant-name>"
 
-  require claude
+  require "$_driver_bin"
   require jq
 
   local seed_file="$REPO_ROOT/seeds/${seed_name}.md"
@@ -480,13 +559,13 @@ cmd_plant() {
   [[ ! -d "$plant_dir" ]] || die "plant already exists: $plant_dir"
 
   # ── scaffold the plant ──────────────────────────────────────────────────
-  mkdir -p "$plant_dir/goals" "$plant_dir/runs/001-genesis" "$plant_dir/memory"
+  mkdir -p "$plant_dir/goals" "$plant_dir/runs/000-genesis" "$plant_dir/memory"
 
   cp "$REPO_ROOT/MOTIVATION.md" "$plant_dir/MOTIVATION.md"
-  cp "$seed_file" "$plant_dir/goals/001-genesis.md"
+  cp "$seed_file" "$plant_dir/goals/000-genesis.md"
   echo "$seed_name" > "$plant_dir/seed"
 
-  local run_dir="$plant_dir/runs/001-genesis"
+  local run_dir="$plant_dir/runs/000-genesis"
   local meta="$run_dir/meta.json"
   local output="$run_dir/output.md"
   local started_at
@@ -497,10 +576,10 @@ cmd_plant() {
 
   # ── write initial run record ─────────────────────────────────────────────
   jq -n \
-    --arg run_id    "001-genesis" \
-    --arg goal_file "goals/001-genesis.md" \
+    --arg run_id    "000-genesis" \
+    --arg goal_file "goals/000-genesis.md" \
     --arg started   "$started_at" \
-    --arg agent     "claude-sonnet-4-6" \
+    --arg agent     "${_driver_model:-$PAK_DRIVER}" \
     '{
       run_id:     $run_id,
       goal_file:  $goal_file,
@@ -517,7 +596,7 @@ cmd_plant() {
   local motivation
   motivation=$(cat "$plant_dir/MOTIVATION.md")
   local goal_content
-  goal_content=$(cat "$plant_dir/goals/001-genesis.md")
+  goal_content=$(cat "$plant_dir/goals/000-genesis.md")
 
   local prompt
   prompt=$(cat <<PROMPT
@@ -546,16 +625,8 @@ PROMPT
   local completed_at
   completed_at=$(iso_now)
 
-  local result_event
-  result_event=$(grep '"type":"result"' "$run_dir/events.jsonl" 2>/dev/null | tail -1 || true)
   local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
-  input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
-  output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
-  cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
-  cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
-  cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
-  num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
-  duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
+  extract_cost "$run_dir/events.jsonl"
 
   local outputs='["output.md"]'
   [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
@@ -593,12 +664,12 @@ PROMPT
   echo "personalagentkit: plant $plant_name is alive → $plant_dir"
 
   # ── auto-commit run directory (P8: git history is the system's memory) ────
-  git -C "$REPO_ROOT" add "$run_dir" "$plant_dir/goals/001-genesis.md" 2>/dev/null
+  git -C "$REPO_ROOT" add "$run_dir" "$plant_dir/goals/000-genesis.md" 2>/dev/null
   git -C "$REPO_ROOT" add -A 2>/dev/null
-  if git -C "$REPO_ROOT" commit -m "run 001-genesis: finalize" 2>/dev/null; then
-    echo "personalagentkit: committed run 001-genesis"
+  if git -C "$REPO_ROOT" commit -m "run 000-genesis: finalize" 2>/dev/null; then
+    echo "personalagentkit: committed run 000-genesis"
   else
-    echo "personalagentkit: WARNING: auto-commit failed for 001-genesis" >&2
+    echo "personalagentkit: WARNING: auto-commit failed for 000-genesis" >&2
   fi
 }
 
@@ -608,7 +679,7 @@ cmd_plant_run() {
   [[ -n "$plant_name" ]]  || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
   [[ -n "$goal_rel" ]]    || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
 
-  require claude
+  require "$_driver_bin"
   require jq
 
   local plant_dir="$REPO_ROOT/plants/$plant_name"
@@ -636,7 +707,7 @@ cmd_plant_run() {
     --arg run_id       "$goal_id" \
     --arg goal_file    "$goal_rel" \
     --arg started      "$started_at" \
-    --arg agent        "claude-sonnet-4-6" \
+    --arg agent        "${_driver_model:-$PAK_DRIVER}" \
     --arg submitted_by "$submitted_by" \
     '{
       run_id:     $run_id,
@@ -702,16 +773,8 @@ PROMPT
   local completed_at
   completed_at=$(iso_now)
 
-  local result_event
-  result_event=$(grep '"type":"result"' "$run_dir/events.jsonl" 2>/dev/null | tail -1 || true)
   local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
-  input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
-  output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
-  cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
-  cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
-  cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
-  num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
-  duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
+  extract_cost "$run_dir/events.jsonl"
 
   local outputs='["output.md"]'
   [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
@@ -1042,7 +1105,7 @@ RETRO
 
 cmd_regenesis() {
   local plant_name="${1:-}"
-  [[ -n "$plant_name" ]] || die "usage: telos regenesis <plant-name> [seed-name]"
+  [[ -n "$plant_name" ]] || die "usage: personalagentkit regenesis <plant-name> [seed-name]"
 
   local plant_dir="$REPO_ROOT/plants/$plant_name"
   [[ -d "$plant_dir" ]] || die "plant not found: plants/$plant_name"
@@ -1050,14 +1113,14 @@ cmd_regenesis() {
   local seed_name="${2:-}"
   if [[ -z "$seed_name" ]]; then
     local seed_file="$plant_dir/seed"
-    [[ -f "$seed_file" ]] || die "no seed file at $seed_file — pass seed name explicitly: telos regenesis $plant_name <seed-name>"
+    [[ -f "$seed_file" ]] || die "no seed file at $seed_file — pass seed name explicitly: personalagentkit regenesis $plant_name <seed-name>"
     seed_name=$(cat "$seed_file")
   fi
 
   local seed_path="$REPO_ROOT/seeds/${seed_name}.md"
   [[ -f "$seed_path" ]] || die "seed not found: seeds/${seed_name}.md"
 
-  require claude
+  require "$_driver_bin"
   require jq
 
   local goals_dir="$REPO_ROOT/goals"
@@ -1123,15 +1186,18 @@ cmd_cycle() {
     esac
   done
   local script="$REPO_ROOT/scripts/dispatch.py"
-  [[ -f "$script" ]] || die "dispatch.py not found: $script"
+  if [[ ! -f "$script" ]] || [[ ! -s "$script" ]]; then
+    cmd_cycle_legacy "$@"
+    return $?
+  fi
   local args=(--workers "$workers" --tend-interval "$tend_interval" --retro-interval "$retro_interval")
   [[ -n "$max_cost" ]] && args+=(--max-cost "$max_cost")
 
   # Clear sentinels from any previous stop/pause
-  rm -f "$REPO_ROOT/.telos-pause" "$REPO_ROOT/.telos-stop"
+  rm -f "$REPO_ROOT/.personalagentkit-pause" "$REPO_ROOT/.personalagentkit-stop"
 
   # Save params so restart can reuse them
-  local params_file="$REPO_ROOT/.telos-cycle-params"
+  local params_file="$REPO_ROOT/.personalagentkit-cycle-params"
   {
     echo "workers=$workers"
     echo "tend_interval=$tend_interval"
@@ -1149,7 +1215,7 @@ cmd_cycle() {
 
   if [[ "$fg" == "false" ]] && [[ -z "${TMUX:-}" ]] && command -v tmux &>/dev/null; then
     # Build the full command to run inside tmux
-    local cmd="cd $(printf '%q' "$REPO_ROOT") && $(printf '%q' "$REPO_ROOT/scripts/telos") cycle --fg"
+    local cmd="cd $(printf '%q' "$REPO_ROOT") && $(printf '%q' "$REPO_ROOT/scripts/personalagentkit") cycle --fg"
     cmd+=" --workers $workers --tend-interval $tend_interval --retro-interval $retro_interval"
     [[ -n "$max_cost" ]] && cmd+=" --max-cost $max_cost"
 
@@ -1158,7 +1224,7 @@ cmd_cycle() {
     tmux new-session -d -s "$session" "$cmd"
     echo "telos: cycle running in tmux session '$session'"
     echo "telos: attach with: tmux attach -t $session"
-    echo "telos: stop with:   ./scripts/telos stop"
+    echo "telos: stop with:   ./scripts/personalagentkit stop"
     return 0
   fi
 
@@ -1166,8 +1232,8 @@ cmd_cycle() {
 }
 
 cmd_restart() {
-  local params_file="$REPO_ROOT/.telos-cycle-params"
-  [[ -f "$params_file" ]] || die "no previous cycle params found — run 'telos cycle' first"
+  local params_file="$REPO_ROOT/.personalagentkit-cycle-params"
+  [[ -f "$params_file" ]] || die "no previous cycle params found — run 'personalagentkit cycle' first"
 
   # Load saved params
   local workers=2 tend_interval=300 retro_interval=14400 max_cost=""
@@ -1186,7 +1252,7 @@ cmd_restart() {
 
   # Signal stop — dispatcher will finish in-flight goals then exit
   echo "telos: signaling stop..."
-  touch "$REPO_ROOT/.telos-stop"
+  touch "$REPO_ROOT/.personalagentkit-stop"
 
   # Wait for the dispatch.py process to exit (however long it takes)
   if command -v tmux &>/dev/null && tmux has-session -t "$session" 2>/dev/null; then
@@ -1212,7 +1278,7 @@ cmd_restart() {
     fi
 
     # Reuse the tmux session — send the new cycle command into it
-    local cmd="cd $(printf '%q' "$REPO_ROOT") && $(printf '%q' "$REPO_ROOT/scripts/telos") cycle --fg"
+    local cmd="cd $(printf '%q' "$REPO_ROOT") && $(printf '%q' "$REPO_ROOT/scripts/personalagentkit") cycle --fg"
     cmd+=" --workers $workers --tend-interval $tend_interval --retro-interval $retro_interval"
     [[ -n "$max_cost" ]] && cmd+=" --max-cost $max_cost"
 
@@ -1293,7 +1359,7 @@ cmd_cycle_legacy() {
     local tended_this_iter=false
     if (( iter % tend_every == 0 )); then
       echo "telos: cycle [$iter] tending garden..."
-      "$REPO_ROOT/scripts/telos" tend
+      "$REPO_ROOT/scripts/personalagentkit" tend
       tended_this_iter=true
     fi
 
@@ -1383,7 +1449,7 @@ cmd_cycle_legacy() {
       fi
       if [[ "$tended_this_iter" == "false" ]]; then
         echo "telos: cycle [$iter] queue empty — tending now to check for new goals..."
-        "$REPO_ROOT/scripts/telos" tend
+        "$REPO_ROOT/scripts/personalagentkit" tend
         tended_this_iter=true
         # re-scan after fallback tend
         best_nnn=999999
@@ -1454,7 +1520,7 @@ cmd_cycle_legacy() {
 
     # step 4: check iteration cap
     if (( iter >= max_iter )); then
-      echo "telos: cycle cap reached ($iter/$max_iter), pending goals remain — run ./telos cycle again to continue"
+      echo "telos: cycle cap reached ($iter/$max_iter), pending goals remain — run ./personalagentkit cycle again to continue"
       break
     fi
 
@@ -1489,9 +1555,9 @@ cmd_cycle_legacy() {
     # step 6: run the best pending goal — route based on assigned_to
     echo "telos: cycle [$iter/$max_iter] → $best_source/$best_goal_rel ($goal_type)"
     if [[ "$best_source" == "root" ]]; then
-      "$REPO_ROOT/scripts/telos" run "$best_goal_rel"
+      "$REPO_ROOT/scripts/personalagentkit" run "$best_goal_rel"
     else
-      "$REPO_ROOT/scripts/telos" plant-run "$best_source" "$best_goal_rel"
+      "$REPO_ROOT/scripts/personalagentkit" plant-run "$best_source" "$best_goal_rel"
     fi
 
     # step 7: check cost cap
@@ -1509,7 +1575,7 @@ cmd_cycle_legacy() {
         local actual_fmt max_fmt
         actual_fmt=$(printf '%.2f' "$cycle_cost")
         max_fmt=$(printf '%.2f' "$max_cost")
-        echo "telos: cycle cost cap reached (\$$actual_fmt / \$$max_fmt), pending goals remain — run ./telos cycle again to continue"
+        echo "telos: cycle cost cap reached (\$$actual_fmt / \$$max_fmt), pending goals remain — run ./personalagentkit cycle again to continue"
         break
       fi
     fi
@@ -1546,7 +1612,7 @@ goal stubs that the next cycle can execute.
 
 1. Read `memory/MEMORY.md` and the most recent retrospective file under `memory/`
    for context on prior state.
-2. Run `./telos garden` and `./telos status` to see what ran.
+2. Run `./personalagentkit garden` and `./personalagentkit status` to see what ran.
 3. Read recent run outputs and reflections across all plants. Look especially for:
    - Loops: same goal type repeating more than 3 times in a row
    - Idle plants: plants with no recent goals despite having unresolved threads
@@ -1578,7 +1644,7 @@ goal stubs that the next cycle can execute.
 RETRO
 
   echo "telos: running post-cycle retrospective → $retro_file"
-  "$REPO_ROOT/scripts/telos" run "goals/${next_nnn}-retrospective.md"
+  "$REPO_ROOT/scripts/personalagentkit" run "goals/${next_nnn}-retrospective.md"
 }
 
 cmd_submit() {
@@ -1594,7 +1660,7 @@ cmd_submit() {
     esac
   done
 
-  [[ -n "$goal_file" ]] || die "usage: telos submit [--plant <name>] [--depends-on <slug,...>] <goal-file>"
+  [[ -n "$goal_file" ]] || die "usage: personalagentkit submit [--plant <name>] [--depends-on <slug,...>] <goal-file>"
   [[ -f "$goal_file" ]] || die "goal file not found: $goal_file"
 
   if [[ -n "$plant_name" ]]; then
@@ -1668,7 +1734,7 @@ cmd_submit() {
     flock -x 200
     git -C "$REPO_ROOT" add "$dest" 2>/dev/null
     git -C "$REPO_ROOT" commit -m "goal: ${goal_num}-${goal_slug}" 2>/dev/null || true
-  ) 200>"$REPO_ROOT/.telos-git.lock"
+  ) 200>"$REPO_ROOT/.personalagentkit-git.lock"
 
   echo "submitted: goals/${goal_num}-${goal_slug}.md"
 }
@@ -1683,7 +1749,7 @@ cmd_await() {
     esac
   done
 
-  [[ -n "$goal_id" ]] || die "usage: telos await <goal-id> [--timeout <seconds>]"
+  [[ -n "$goal_id" ]] || die "usage: personalagentkit await <goal-id> [--timeout <seconds>]"
 
   local elapsed=0
   echo "telos: await $goal_id (timeout=${timeout}s)"
@@ -1726,11 +1792,11 @@ cmd_await() {
 }
 
 cmd_watch() {
-  trap 'printf "\ntelos: done\n"; exit 0' INT TERM
+  trap 'printf "\npersonalagentkit: done\n"; exit 0' INT TERM
 
   while true; do
     printf '\033[2J\033[H'
-    printf 'telos: watching... (ctrl-c to stop)\n\n'
+    printf 'personalagentkit: watching... (ctrl-c to stop)\n\n'
 
     local now_epoch
     now_epoch=$(date +%s)
@@ -1752,7 +1818,7 @@ cmd_watch() {
       started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
 
       local started_epoch elapsed em es
-      started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" "+%s" 2>/dev/null || echo 0)
+      started_epoch=$(iso_to_epoch "$started_at")
       elapsed=$(( now_epoch - started_epoch ))
       em=$(( elapsed / 60 ))
       es=$(( elapsed % 60 ))
@@ -1785,7 +1851,7 @@ cmd_watch() {
 
 cmd_priority() {
   local goal_id="${1:-}" priority="${2:-}"
-  [[ -n "$goal_id" && -n "$priority" ]] || die "usage: telos priority <goal-id> <N>"
+  [[ -n "$goal_id" && -n "$priority" ]] || die "usage: personalagentkit priority <goal-id> <N>"
   local goal_file
   goal_file=$(ls "$REPO_ROOT/goals/${goal_id}"*.md 2>/dev/null | head -1)
   [[ -n "$goal_file" && -f "$goal_file" ]] || die "goal not found: $goal_id"
@@ -1812,13 +1878,13 @@ PYEOF
     flock -x 200
     git -C "$REPO_ROOT" add "$goal_file" 2>/dev/null
     git -C "$REPO_ROOT" commit -m "priority: $goal_id → $priority" 2>/dev/null || true
-  ) 200>"$REPO_ROOT/.telos-git.lock"
+  ) 200>"$REPO_ROOT/.personalagentkit-git.lock"
   echo "telos: priority set → $goal_file (priority: $priority)"
 }
 
 cmd_cancel() {
   local goal_id="${1:-}"
-  [[ -n "$goal_id" ]] || die "usage: telos cancel <goal-id>"
+  [[ -n "$goal_id" ]] || die "usage: personalagentkit cancel <goal-id>"
   local goal_file
   goal_file=$(ls "$REPO_ROOT/goals/${goal_id}"*.md 2>/dev/null | head -1)
   [[ -n "$goal_file" && -f "$goal_file" ]] || die "goal not found: $goal_id"
@@ -1829,28 +1895,28 @@ cmd_cancel() {
     git -C "$REPO_ROOT" rm "$goal_file" 2>/dev/null || true
     git -C "$REPO_ROOT" add "$cancelled" 2>/dev/null
     git -C "$REPO_ROOT" commit -m "cancel: $goal_id" 2>/dev/null || true
-  ) 200>"$REPO_ROOT/.telos-git.lock"
+  ) 200>"$REPO_ROOT/.personalagentkit-git.lock"
   echo "telos: cancelled → $cancelled"
 }
 
 cmd_pause() {
-  touch "$REPO_ROOT/.telos-pause"
-  echo "telos: pause sentinel set (.telos-pause)"
+  touch "$REPO_ROOT/.personalagentkit-pause"
+  echo "telos: pause sentinel set (.personalagentkit-pause)"
 }
 
 cmd_stop() {
-  touch "$REPO_ROOT/.telos-stop"
-  echo "telos: stop sentinel set (.telos-stop)"
+  touch "$REPO_ROOT/.personalagentkit-stop"
+  echo "telos: stop sentinel set (.personalagentkit-stop)"
 }
 
 cmd_resume() {
-  rm -f "$REPO_ROOT/.telos-pause" "$REPO_ROOT/.telos-stop"
+  rm -f "$REPO_ROOT/.personalagentkit-pause" "$REPO_ROOT/.personalagentkit-stop"
   echo "telos: sentinels cleared"
 }
 
 cmd_help() {
   cat <<'HELP'
-telos — minimal goal runner
+personalagentkit — minimal goal runner
 
 Commands:
   run <goal-file>            Run a goal, record what happened
@@ -1892,25 +1958,25 @@ Goal frontmatter (optional YAML block at top of goal file):
   ---
 
 Examples:
-  ./telos run goals/002-something.md
-  ./telos status
-  ./telos watch
-  ./telos plant coder first-coder
-  ./telos plant-run first-coder goals/002-next.md
-  ./telos garden
-  ./telos tend
-  ./telos submit --plant first-coder /tmp/my-goal.md
-  ./telos submit --plant explorer --depends-on 012-build-lib --priority 3 /tmp/spike.md
-  ./telos await 013-my-goal
-  ./telos await 013-my-goal --timeout 600
-  ./telos cycle
-  ./telos cycle --workers 3 --tend-interval 120
-  ./telos cycle --workers 2 --max-cost 5.00
-  ./telos priority 007-fix-bug 2
-  ./telos cancel 007-fix-bug
-  ./telos pause
-  ./telos stop
-  ./telos resume
+  ./personalagentkit run goals/002-something.md
+  ./personalagentkit status
+  ./personalagentkit watch
+  ./personalagentkit plant coder first-coder
+  ./personalagentkit plant-run first-coder goals/002-next.md
+  ./personalagentkit garden
+  ./personalagentkit tend
+  ./personalagentkit submit --plant first-coder /tmp/my-goal.md
+  ./personalagentkit submit --plant explorer --depends-on 012-build-lib --priority 3 /tmp/spike.md
+  ./personalagentkit await 013-my-goal
+  ./personalagentkit await 013-my-goal --timeout 600
+  ./personalagentkit cycle
+  ./personalagentkit cycle --workers 3 --tend-interval 120
+  ./personalagentkit cycle --workers 2 --max-cost 5.00
+  ./personalagentkit priority 007-fix-bug 2
+  ./personalagentkit cancel 007-fix-bug
+  ./personalagentkit pause
+  ./personalagentkit stop
+  ./personalagentkit resume
 HELP
 }
 
@@ -1936,5 +2002,5 @@ case "${1:-help}" in
   restart)    cmd_restart ;;
   resume)     cmd_resume ;;
   help)       cmd_help ;;
-  *)          die "unknown command: $1 (try: telos help)" ;;
+  *)          die "unknown command: $1 (try: personalagentkit help)" ;;
 esac
