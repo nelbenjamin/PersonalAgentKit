@@ -21,22 +21,35 @@ cp shared/charter.md ../setup/charter.md
 edit ../setup/charter.md
 
 # Bootstrap and plant
-./personalagentkit-genesis
+./personalagentkit-genesis          # defaults to claude
+./personalagentkit-genesis codex    # use codex as the default driver
 ```
 
-Genesis reads `../setup/charter.md` (or pass a path: `./personalagentkit-genesis /path/to/setup`).
-It takes a few minutes. The agent will name itself, write its first memory,
-and leave you a message in `coordinator/inbox/`.
+Genesis reads `../setup/charter.md`. The optional argument sets the driver
+for genesis and becomes the default for all subsequent runs. It takes a few
+minutes. The agent will name itself, write its first memory, and leave you
+a message in `coordinator/inbox/`.
 
 ## Drivers
 
-By default the kit uses Claude Code (`PAK_DRIVER=claude`). To use Codex:
+The kit ships with `claude` and `codex` drivers. Pass the driver name to
+genesis to select it:
 
 ```bash
-export PAK_DRIVER=codex
-export PAK_MODEL=gpt-5.4   # optional, overrides the default
-./personalagentkit-genesis
+./personalagentkit-genesis claude   # Claude Code (default)
+./personalagentkit-genesis codex    # OpenAI Codex
 ```
+
+Per-goal routing is also supported via frontmatter:
+
+```markdown
+---
+driver: codex
+---
+# My goal
+```
+
+Additional drivers can be added as `runner/drivers/<name>_driver.py` plugins.
 
 ## Start the cycle
 
