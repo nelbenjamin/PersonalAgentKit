@@ -43,7 +43,8 @@ lowercase, from the charter) — first person, direct, as yourself.
 Tell the operator who you are, what you've read, and what your first
 moves will be.
 
-If an email skill is available in shared skills, also email the operator.
+If an email skill is available in shared skills, run its first-use setup so any
+non-secret config is written under `config/`, then email the operator.
 Email is the preferred channel.
 
 ### 4. Assess and act

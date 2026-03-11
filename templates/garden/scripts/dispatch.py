@@ -36,6 +36,72 @@ def normalize_run_status(status: Optional[str]) -> Optional[str]:
     return STATUS_ALIASES.get(status, status)
 
 
+def parse_frontmatter(text: str) -> dict[str, object]:
+    """Parse the narrow frontmatter subset used by the dispatcher.
+
+    Supported forms:
+      key: value
+      key: [a, b]
+      key:
+        - a
+        - b
+    """
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+
+    lines = parts[1].splitlines()
+    parsed: dict[str, object] = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in line:
+            i += 1
+            continue
+
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if value:
+            parsed[key] = value
+            i += 1
+            continue
+
+        items: list[str] = []
+        j = i + 1
+        while j < len(lines):
+            next_line = lines[j]
+            next_stripped = next_line.strip()
+            if not next_stripped:
+                j += 1
+                continue
+            if next_line[:1].isspace() and next_stripped.startswith("- "):
+                items.append(next_stripped[2:].strip())
+                j += 1
+                continue
+            break
+        parsed[key] = items if items else ""
+        i = j
+
+    return parsed
+
+
+def parse_frontmatter_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    if not isinstance(value, str):
+        return []
+    stripped = value.strip()
+    if not stripped:
+        return []
+    if stripped.startswith("[") and stripped.endswith("]"):
+        stripped = stripped[1:-1]
+    return [item.strip() for item in stripped.split(",") if item.strip()]
+
+
 def preferred_run_cost_usd(meta: dict) -> Optional[float]:
     cost = meta.get("cost")
     if isinstance(cost, (int, float)):
@@ -85,6 +151,8 @@ class Dispatcher:
         self._stop_requested = False
         self._recent_completions = 0
         self._startup_gardener_run_id: Optional[str] = None
+        self._hook_last_run: dict[str, float] = {}
+        self._hook_poll_lock = threading.Lock()
 
         # On startup, scan all plants for live runs to restore in-memory state.
         # Prevents concurrent dispatch when the dispatcher restarts while a run
@@ -256,36 +324,29 @@ class Dispatcher:
 
             # Parse frontmatter first (needed for plant-aware _has_run check)
             assigned_to = ""
-            depends_on_raw = ""
-            requires_raw = ""
+            depends_on: list[str] = []
+            requires: list[str] = []
             not_before_raw = ""
             priority = 5
             driver = ""
             model = ""
             try:
-                text = goal_path.read_text()
-                if text.startswith("---"):
-                    parts = text.split("---", 2)
-                    if len(parts) >= 2:
-                        fm = parts[1]
-                        for line in fm.splitlines():
-                            if line.startswith("assigned_to:"):
-                                assigned_to = line.split(":", 1)[1].strip()
-                            elif line.startswith("depends_on:"):
-                                depends_on_raw = line.split(":", 1)[1].strip()
-                            elif line.startswith("requires:"):
-                                requires_raw = line.split(":", 1)[1].strip()
-                            elif line.startswith("not_before:"):
-                                not_before_raw = line.split(":", 1)[1].strip()
-                            elif line.startswith("priority:"):
-                                try:
-                                    priority = int(line.split(":", 1)[1].strip())
-                                except ValueError:
-                                    pass
-                            elif line.startswith("driver:"):
-                                driver = line.split(":", 1)[1].strip()
-                            elif line.startswith("model:"):
-                                model = line.split(":", 1)[1].strip()
+                metadata = parse_frontmatter(goal_path.read_text())
+                if isinstance(metadata.get("assigned_to"), str):
+                    assigned_to = metadata["assigned_to"].strip()
+                depends_on = parse_frontmatter_list(metadata.get("depends_on"))
+                requires = parse_frontmatter_list(metadata.get("requires"))
+                if isinstance(metadata.get("not_before"), str):
+                    not_before_raw = metadata["not_before"].strip()
+                if isinstance(metadata.get("priority"), (str, int)):
+                    try:
+                        priority = int(str(metadata["priority"]).strip())
+                    except ValueError:
+                        pass
+                if isinstance(metadata.get("driver"), str):
+                    driver = metadata["driver"].strip()
+                if isinstance(metadata.get("model"), str):
+                    model = metadata["model"].strip()
             except Exception:
                 pass
 
@@ -307,12 +368,11 @@ class Dispatcher:
                     pass
 
             # Check dependencies
-            if depends_on_raw:
-                deps = [d.strip() for d in depends_on_raw.strip("[]").split(",") if d.strip()]
-                dep_results = [self._check_dep(d) for d in deps]
+            if depends_on:
+                dep_results = [self._check_dep(d) for d in depends_on]
                 if "impossible" in dep_results:
                     # Auto-cancel: a dependency resolved to the wrong status
-                    impossible_deps = [d for d, r in zip(deps, dep_results) if r == "impossible"]
+                    impossible_deps = [d for d, r in zip(depends_on, dep_results) if r == "impossible"]
                     cancelled = goal_path.with_suffix(".cancelled")
                     goal_path.rename(cancelled)
                     print(
@@ -339,11 +399,10 @@ class Dispatcher:
                     continue
 
             # Check capability gaps (named: capability-gap-<name>.md)
-            if assigned_to and requires_raw:
-                reqs = [r.strip() for r in requires_raw.strip("[]").split(",") if r.strip()]
+            if assigned_to and requires:
                 plant_dir = self.repo_root / "plants" / assigned_to
                 blocked_by_gap = []
-                for req in reqs:
+                for req in requires:
                     if (plant_dir / f"capability-gap-{req}.md").exists():
                         blocked_by_gap.append(req)
                 if blocked_by_gap:
@@ -408,6 +467,125 @@ class Dispatcher:
                     print(f"personalagentkit: {line}", flush=True)
         except Exception as e:
             print(f"personalagentkit: read-email failed (non-fatal): {e}", flush=True)
+
+    # ── hook polling ──────────────────────────────────────────────────────────
+
+    def _discover_hooks(self) -> list[Path]:
+        hooks_dir = self.repo_root / "hooks"
+        if not hooks_dir.is_dir():
+            return []
+
+        hooks: list[Path] = []
+        for path in sorted(hooks_dir.iterdir()):
+            try:
+                if not path.is_file():
+                    continue
+                if not os.access(path, os.X_OK):
+                    continue
+            except OSError:
+                continue
+            hooks.append(path)
+        return hooks
+
+    def _read_hook_interval(self, hook_path: Path) -> int:
+        default_interval = self.tend_interval
+        try:
+            with hook_path.open() as handle:
+                for _ in range(20):
+                    line = handle.readline()
+                    if not line:
+                        break
+                    match = re.match(r"^\s*#\s*interval:\s*(\d+)\s*$", line)
+                    if not match:
+                        continue
+                    interval = int(match.group(1))
+                    if interval <= 0:
+                        raise ValueError("interval must be positive")
+                    return interval
+        except Exception as exc:
+            print(
+                f"personalagentkit: hook {hook_path.name} interval parse failed "
+                f"(defaulting to {default_interval}s): {exc}",
+                flush=True,
+            )
+        return default_interval
+
+    def _run_hooks(self, now: Optional[float] = None) -> bool:
+        if not self._hook_poll_lock.acquire(blocking=False):
+            return False
+
+        actionable = False
+        if now is None:
+            now = time.time()
+
+        try:
+            hooks = self._discover_hooks()
+            for hook_path in hooks:
+                interval = self._read_hook_interval(hook_path)
+                last_run = self._hook_last_run.get(hook_path.name)
+                if last_run is not None and (now - last_run) < interval:
+                    continue
+
+                self._hook_last_run[hook_path.name] = now
+                try:
+                    result = subprocess.run(
+                        [str(hook_path)],
+                        cwd=self.repo_root,
+                        capture_output=True,
+                        text=True,
+                        timeout=max(60, interval),
+                    )
+                except Exception as exc:
+                    print(
+                        f"personalagentkit: hook {hook_path.name} failed (non-fatal): {exc}",
+                        flush=True,
+                    )
+                    continue
+
+                for line in result.stdout.splitlines():
+                    if line.strip():
+                        print(
+                            f"personalagentkit: hook {hook_path.name}: {line}",
+                            flush=True,
+                        )
+                for line in result.stderr.splitlines():
+                    if line.strip():
+                        print(
+                            f"personalagentkit: hook {hook_path.name} stderr: {line}",
+                            flush=True,
+                        )
+
+                if result.returncode == 0:
+                    continue
+                if result.returncode == 1:
+                    print(
+                        f"personalagentkit: hook {hook_path.name} signaled actionable work",
+                        flush=True,
+                    )
+                    actionable = True
+                    continue
+
+                print(
+                    f"personalagentkit: hook {hook_path.name} exited {result.returncode} "
+                    "(non-fatal)",
+                    flush=True,
+                )
+            return actionable
+        finally:
+            self._hook_poll_lock.release()
+
+    def _wait_until(self, deadline: float, *, poll_hooks: bool = False) -> None:
+        """Wait cooperatively until deadline, checking sentinels and optional hooks."""
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            if self._stop_set() or self._pause_set():
+                return
+            self.slot_freed.wait(timeout=min(1.0, remaining))
+            self.slot_freed.clear()
+            if poll_hooks and self._run_hooks():
+                self.quiet_event.set()
 
     # ── running plant check ───────────────────────────────────────────────────
 
@@ -691,8 +869,10 @@ class Dispatcher:
                 with self.lock:
                     self.gardener_running = True
                 should_tend = True
+                hook_actionable = False
                 try:
                     self._poll_inbox()
+                    hook_actionable = self._run_hooks()
 
                     # Suppress tends when there is nothing to do, regardless of
                     # trigger source (timer or quiet-event). The quiet-event path
@@ -707,7 +887,9 @@ class Dispatcher:
                         print("personalagentkit: .personalagentkit-force-tend sentinel — forcing tend", flush=True)
                     else:
                         has_work, reason = self._has_work(since=last_tend)
-                        if not has_work:
+                        if hook_actionable:
+                            reason = "hook signaled actionable work"
+                        if not has_work and not hook_actionable:
                             print(
                                 "personalagentkit: skipping tend — nothing to do "
                                 "(no queue, no inbox, no active goals)",
@@ -967,6 +1149,8 @@ class Dispatcher:
                         return
 
             # Scan queue and fill slots
+            if self._run_hooks():
+                self.quiet_event.set()
             entries, blocked, earliest_nb = self._scan_queue()
             launched = self._fill_slots(entries)
 
@@ -1040,12 +1224,8 @@ class Dispatcher:
                             f"({wait_secs:.0f}s)",
                             flush=True,
                         )
-                        # Sleep in short intervals so sentinels are still checked
                         wake_time = time.time() + wait_secs
-                        while time.time() < wake_time:
-                            if self._stop_set() or self._pause_set():
-                                break
-                            time.sleep(min(30, wake_time - time.time()))
+                        self._wait_until(wake_time, poll_hooks=True)
                     continue
 
                 if blocked == 0:
@@ -1118,6 +1298,9 @@ class Dispatcher:
                                             break
                                     except Exception:
                                         pass
+                        if self._run_hooks():
+                            self.quiet_event.set()
+                            wake_time = 0
                     continue
 
             # Clear quiet if slots are active

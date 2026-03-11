@@ -16,15 +16,39 @@ garden can adapt this pattern.
 ## Prerequisites
 
 - API key stored in `secrets/agentmail-api-key.txt` (readable by the garden agent)
-- Inbox address: `[your-inbox]@agentmail.to` (shared across all gardens)
+- Inbox id discoverable from the Agentmail API with the same API key
+- Persistent non-secret config should be written under `config/`
+
+## First-use setup
+
+Discover and persist the inbox id before using the raw API directly:
+
+```bash
+./hooks/setup-agentmail.sh
+source config/agentmail.env
+```
+
+`hooks/setup-agentmail.sh` reads `secrets/agentmail-api-key.txt`, calls
+`GET /v0/inboxes`, reuses the inbox whose `client_id` is
+`personalagentkit-shared-inbox-v1` when present, otherwise creates it with
+`POST /v0/inboxes`, and writes `config/agentmail.env` with
+`AGENTMAIL_INBOX_ID=...`. If create fails, it falls back to the first listed
+inbox. If neither path yields a usable inbox, it prints manual
+`config/agentmail.env` guidance and exits `0` so optional hooks stay inert.
+This keeps secrets out of `config/` while making the inbox id available to
+hooks and future runs.
+
+This setup is intentionally shared across the group. Older per-agent inboxes
+can exist in the account, but setup ignores them unless you explicitly set
+`AGENTMAIL_INBOX_ID` yourself.
 
 ## Send a message
 
 ```bash
 API_KEY=$(cat /path/to/secrets/agentmail-api-key.txt)
-INBOX_ID="yourinbox@agentmail.to"
+source /path/to/config/agentmail.env
 
-curl -s -X POST "https://api.agentmail.to/v0/inboxes/${INBOX_ID}/messages/send" \
+curl -s -X POST "https://api.agentmail.to/v0/inboxes/${AGENTMAIL_INBOX_ID}/messages/send" \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -38,7 +62,8 @@ Or inline in a shell script:
 
 ```bash
 API_KEY=$(cat secrets/agentmail-api-key.txt)
-curl -s -X POST "https://api.agentmail.to/v0/inboxes/yourinbox@agentmail.to/messages/send" \
+source config/agentmail.env
+curl -s -X POST "https://api.agentmail.to/v0/inboxes/${AGENTMAIL_INBOX_ID}/messages/send" \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d "{\"to\": [\"[operator@email.com]\"], \"subject\": \"[garden] subject\", \"text\": \"Body text.\"}"
@@ -48,9 +73,9 @@ curl -s -X POST "https://api.agentmail.to/v0/inboxes/yourinbox@agentmail.to/mess
 
 ```bash
 API_KEY=$(cat secrets/agentmail-api-key.txt)
-INBOX_ID="yourinbox@agentmail.to"
+source config/agentmail.env
 
-curl -s "https://api.agentmail.to/v0/inboxes/${INBOX_ID}/messages" \
+curl -s "https://api.agentmail.to/v0/inboxes/${AGENTMAIL_INBOX_ID}/messages" \
   -H "Authorization: Bearer ${API_KEY}" | python3 -m json.tool
 ```
 
@@ -75,7 +100,7 @@ or `in` check (e.g., `"[operator@email.com]" in msg["from"].lower()`).
 
 MSG_ID_ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$MESSAGE_ID")
 
-curl -s "https://api.agentmail.to/v0/inboxes/${INBOX_ID}/messages/${MSG_ID_ENCODED}" \
+curl -s "https://api.agentmail.to/v0/inboxes/${AGENTMAIL_INBOX_ID}/messages/${MSG_ID_ENCODED}" \
   -H "Authorization: Bearer ${API_KEY}" | python3 -m json.tool
 ```
 
@@ -87,13 +112,13 @@ Using `/messages/send` instead creates a new thread every time.
 
 ```bash
 API_KEY=$(cat secrets/agentmail-api-key.txt)
-INBOX_ID="[your-inbox]@agentmail.to"
+source config/agentmail.env
 
 # MESSAGE_ID is from the inbox file frontmatter (e.g., the message_id of [Operator]'s message)
 # It MUST be URL-encoded — contains <, >, @ characters
 MSG_ID_ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$MESSAGE_ID")
 
-curl -s -X POST "https://api.agentmail.to/v0/inboxes/${INBOX_ID}/messages/${MSG_ID_ENCODED}/reply" \
+curl -s -X POST "https://api.agentmail.to/v0/inboxes/${AGENTMAIL_INBOX_ID}/messages/${MSG_ID_ENCODED}/reply" \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d "{\"text\": \"Reply body here.\"}"
@@ -112,9 +137,12 @@ Response contains `message_id` and `thread_id` of the new reply message.
 On garden genesis, verify email capability works before proceeding:
 
 ```bash
+./hooks/setup-agentmail.sh
+
 # Send a test email to confirm the skill is operational
 API_KEY=$(cat secrets/agentmail-api-key.txt)
-curl -s -X POST "https://api.agentmail.to/v0/inboxes/yourinbox@agentmail.to/messages/send" \
+source config/agentmail.env
+curl -s -X POST "https://api.agentmail.to/v0/inboxes/${AGENTMAIL_INBOX_ID}/messages/send" \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d "{\"to\": [\"[operator@email.com]\"], \"subject\": \"[garden] email capability confirmed\", \"text\": \"Test send from genesis run. Email skill is operational.\"}"
@@ -123,6 +151,9 @@ curl -s -X POST "https://api.agentmail.to/v0/inboxes/yourinbox@agentmail.to/mess
 ## Notes
 
 - API key should be placed in `secrets/agentmail-api-key.txt` within the garden
-- All gardens share the single inbox `[your-inbox]@agentmail.to`
+- The inbox id is non-secret and should be persisted in `config/agentmail.env`
+- `hooks/setup-agentmail.sh` uses one shared inbox for the group, keyed by
+  `personalagentkit-shared-inbox-v1`
+- `AGENTMAIL_INBOX_ID` in the environment still overrides the config for backward compatibility
 - Subject prefix convention: `[garden-name]` for identification when multiple gardens share a channel
 - Operator email: `[operator@email.com]`

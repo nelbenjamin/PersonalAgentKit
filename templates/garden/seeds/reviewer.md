@@ -38,8 +38,8 @@ You have just come online. Build your foundation:
    that requires 20+ checks per run is bureaucracy, not quality assurance.
 
 3. **Review something real** — look at recent runs in the entity's git history.
-   Pick one completed `build`, `fix`, or `spike` run. Read its `_stdout.md`,
-   `meta.json`, and `reflection.md`. Write a brief review in
+   Pick one completed `build`, `fix`, or `spike` run. Read its
+   `meta.json` and `reflection.md`. Write a brief review in
    `runs/001-genesis/review.md`. Apply your rubric. Be honest.
 
 4. **Write `feedback.md` to the reviewed run's directory** — after writing

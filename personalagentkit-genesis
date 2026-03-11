@@ -56,7 +56,7 @@ fi
 
 # 3. Final Prep
 cd "$COORDINATOR_DIR"
-mkdir -p goals horizons inbox memory plants runs schema scripts seeds superseeds skills
+mkdir -p config goals horizons inbox memory plants runs schema scripts seeds superseeds skills
 
 # 4. Write driver config so the agent inherits the same driver
 echo "$PAK_DRIVER" > "$COORDINATOR_DIR/.personalagentkit-driver"

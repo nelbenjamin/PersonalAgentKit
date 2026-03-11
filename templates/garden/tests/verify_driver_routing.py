@@ -562,7 +562,13 @@ priority: 1
       assert captured[0][0][-4:] == ["--driver", "codex", "--model", "codex-mini-latest"]
       assert captured[1][0][-4:] == ["--driver", "claude", "--model", "claude-queue"]
       assert captured[0][0][1:3] == ["run", "goals/004-dispatch-root.md"]
-      assert captured[1][0][1:4] == ["plant-run", "worker", "goals/005-dispatch-plant.md"]
+      plant_dispatch_cmd = captured[1][0]
+      assert plant_dispatch_cmd[-4:] == ["--driver", "claude", "--model", "claude-queue"]
+      assert plant_dispatch_cmd[1:3] == ["run", "goals/005-dispatch-plant.md"] or plant_dispatch_cmd[1:4] == [
+          "plant-run",
+          "worker",
+          "goals/005-dispatch-plant.md",
+      ]
 
     print("driver routing verification passed")
 

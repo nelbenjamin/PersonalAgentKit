@@ -270,7 +270,7 @@ def ensure_reflection_artifact(*, run_dir: Path, status: str, output: str) -> st
     if reflection_path.is_file():
         return None
 
-    print(f"personalagentkit: WARNING: reflection.md missing from {run_dir.name}", flush=True)
+    print(f"personalagentkit: WARNING: reflection.md missing from {run_dir.name}", file=sys.stderr, flush=True)
     return None
 
 

@@ -28,6 +28,120 @@ require() {
   command -v "$1" &>/dev/null || die "required tool not found: $1"
 }
 
+github_usage() {
+  cat <<'HELP'
+Usage:
+  ./scripts/personalagentkit publish-github [--remote <name>] [--head <branch>] [--base <branch>]
+                                            [--owner <owner>] [--repo <repo>]
+                                            [--title <title>] [--body <body>] [--draft]
+
+Config:
+  Reads durable defaults from config/github.env.
+  Reads the GitHub token from secrets/github-token.txt.
+
+Behavior:
+  Pushes the current branch over HTTPS with non-interactive git.
+  Opens a pull request through the GitHub REST API with curl.
+  If the token file is missing or empty, prints a clear skip message and exits 0.
+HELP
+}
+
+github_config_file() {
+  printf '%s\n' "${PAK_GITHUB_CONFIG_FILE:-$REPO_ROOT/config/github.env}"
+}
+
+github_token_file() {
+  printf '%s\n' "${PAK_GITHUB_TOKEN_FILE:-$REPO_ROOT/secrets/github-token.txt}"
+}
+
+github_load_config() {
+  local path="$1"
+  [[ -f "$path" ]] || die "missing GitHub config file: $path (see config/github.env.example)"
+  set -a
+  # shellcheck disable=SC1090
+  . "$path"
+  set +a
+}
+
+github_normalize_bool() {
+  case "${1:-false}" in
+    1|true|TRUE|yes|YES|on|ON) echo "true" ;;
+    0|false|FALSE|no|NO|off|OFF|"") echo "false" ;;
+    *) die "invalid boolean value: $1" ;;
+  esac
+}
+
+github_current_branch() {
+  git rev-parse --abbrev-ref HEAD
+}
+
+github_read_token() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    echo "personalagentkit: skipping publish-github: missing GitHub token at $path. Add a token and rerun."
+    return 10
+  fi
+
+  local token
+  token="$(tr -d '\r\n' < "$path")"
+  if [[ -z "$token" ]]; then
+    echo "personalagentkit: skipping publish-github: GitHub token file is empty at $path. Add a token and rerun."
+    return 10
+  fi
+
+  GITHUB_READ_TOKEN_RESULT="$token"
+  return 0
+}
+
+github_push_branch() {
+  local remote="$1"
+  local head_branch="$2"
+  local token="$3"
+  local askpass
+  askpass="$(mktemp)"
+  cat > "$askpass" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *Username*) printf '%s\n' "x-access-token" ;;
+  *) printf '%s\n' "$GITHUB_TOKEN_FOR_PUSH" ;;
+esac
+EOF
+  chmod 700 "$askpass"
+
+  local origin_url
+  origin_url="$(git remote get-url "$remote")"
+  [[ "$origin_url" == https://* ]] || die "remote '$remote' must use HTTPS, found: $origin_url"
+
+  local git_status=0
+  GIT_TERMINAL_PROMPT=0 \
+  GIT_ASKPASS="$askpass" \
+  GITHUB_TOKEN_FOR_PUSH="$token" \
+    git push "$remote" "HEAD:refs/heads/$head_branch" || git_status=$?
+
+  rm -f "$askpass"
+  return "$git_status"
+}
+
+github_create_pr() {
+  local api_base_url="$1"
+  local owner="$2"
+  local repo="$3"
+  local token="$4"
+  local request_json="$5"
+
+  curl \
+    --silent \
+    --show-error \
+    --fail-with-body \
+    --request POST \
+    --url "$api_base_url/repos/$owner/$repo/pulls" \
+    --header "Accept: application/vnd.github+json" \
+    --header "Authorization: Bearer $token" \
+    --header "X-GitHub-Api-Version: 2022-11-28" \
+    --header "Content-Type: application/json" \
+    --data "$request_json"
+}
+
 # flock shim for macOS (no flock without brew install util-linux).
 # When flock is unavailable, the subshell still runs — just without cross-process locking.
 if ! command -v flock &>/dev/null; then
@@ -805,7 +919,7 @@ Run these from the personalagentkit root:
 
 For each plant:
 - Read `plants/<name>/memory/MEMORY.md`
-- Read its most recent run's `meta.json`, `_stdout.md`, `reflection.md`
+- Read its most recent run's `meta.json`, `reflection.md`
 - Check for `plants/<name>/capability-gap-*.md` — named gap files identify
   specific missing capabilities (e.g., `capability-gap-sms-receipt.md`).
   Commission gap-closing goals as needed. Goals that `requires:` a gapped
@@ -1764,6 +1878,82 @@ cmd_stop() {
   echo "telos: stop sentinel set (.personalagentkit-stop)"
 }
 
+cmd_publish_github() {
+  require git
+  require curl
+  require jq
+
+  local cli_remote="" cli_head="" cli_base="" cli_owner="" cli_repo=""
+  local cli_title="" cli_body="" cli_draft=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remote) [[ -n "${2:-}" ]] || die "--remote requires a value"; cli_remote="$2"; shift 2 ;;
+      --head) [[ -n "${2:-}" ]] || die "--head requires a value"; cli_head="$2"; shift 2 ;;
+      --base) [[ -n "${2:-}" ]] || die "--base requires a value"; cli_base="$2"; shift 2 ;;
+      --owner) [[ -n "${2:-}" ]] || die "--owner requires a value"; cli_owner="$2"; shift 2 ;;
+      --repo) [[ -n "${2:-}" ]] || die "--repo requires a value"; cli_repo="$2"; shift 2 ;;
+      --title) [[ -n "${2:-}" ]] || die "--title requires a value"; cli_title="$2"; shift 2 ;;
+      --body) [[ -n "${2:-}" ]] || die "--body requires a value"; cli_body="$2"; shift 2 ;;
+      --draft) cli_draft="true"; shift ;;
+      --help|-h) github_usage; exit 0 ;;
+      --*) die "unknown argument: $1" ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+
+  local config_file token_file
+  config_file="$(github_config_file)"
+  token_file="$(github_token_file)"
+  github_load_config "$config_file"
+
+  GITHUB_READ_TOKEN_RESULT=""
+  github_read_token "$token_file" || {
+    local token_status=$?
+    [[ "$token_status" -eq 10 ]] && return 0
+    return "$token_status"
+  }
+  local token="$GITHUB_READ_TOKEN_RESULT"
+
+  local remote="${cli_remote:-${GITHUB_REMOTE:-origin}}"
+  local head_branch="${cli_head:-$(github_current_branch)}"
+  local base_branch="${cli_base:-${GITHUB_BASE_BRANCH:-}}"
+  local owner="${cli_owner:-${GITHUB_REPO_OWNER:-}}"
+  local repo="${cli_repo:-${GITHUB_REPO_NAME:-}}"
+  local title="${cli_title:-${GITHUB_PR_TITLE:-Publish $head_branch}}"
+  local body="${cli_body:-${GITHUB_PR_BODY:-}}"
+  local draft
+  draft="$(github_normalize_bool "${cli_draft:-${GITHUB_PR_DRAFT:-false}}")"
+  local api_base_url="${GITHUB_API_BASE_URL:-https://api.github.com}"
+
+  [[ -n "$owner" ]] || die "GITHUB_REPO_OWNER is required in $config_file or via --owner"
+  [[ -n "$repo" ]] || die "GITHUB_REPO_NAME is required in $config_file or via --repo"
+  [[ -n "$base_branch" ]] || die "GITHUB_BASE_BRANCH is required in $config_file or via --base"
+  [[ -n "$head_branch" && "$head_branch" != "HEAD" ]] || die "current branch is detached; pass --head explicitly"
+
+  local request_json
+  request_json="$(jq -n \
+    --arg title "$title" \
+    --arg head "$head_branch" \
+    --arg base "$base_branch" \
+    --arg body "$body" \
+    --argjson draft "$draft" \
+    '{title: $title, head: $head, base: $base, body: $body, draft: $draft}')"
+
+  github_push_branch "$remote" "$head_branch" "$token"
+
+  local response pr_url
+  response="$(github_create_pr "$api_base_url" "$owner" "$repo" "$token" "$request_json")"
+  pr_url="$(printf '%s' "$response" | jq -r '.html_url // empty')"
+
+  if [[ -n "$pr_url" ]]; then
+    echo "personalagentkit: publish-github pushed $head_branch to $remote and opened PR: $pr_url"
+  else
+    echo "personalagentkit: publish-github pushed $head_branch to $remote and created pull request via $api_base_url/repos/$owner/$repo/pulls"
+    printf '%s\n' "$response"
+  fi
+}
+
 cmd_resume() {
   rm -f "$REPO_ROOT/.personalagentkit-pause" "$REPO_ROOT/.personalagentkit-stop"
   echo "telos: sentinels cleared"
@@ -1785,6 +1975,7 @@ Commands:
   tend                       Write a tend goal for head-gardener and run it
   retrospective              Write a retrospective goal for gardener and run it
   regenesis <plant> [seed]   Re-inject updated seed into a plant's memory
+  publish-github             Push the current branch and open a pull request via config/github.env
   submit [--plant <name>] [--depends-on <slug,...>] [--priority N] [--driver D] [--model M] <goal-file>
                              Write a goal to goals/ with frontmatter; exits immediately
   await <goal-id> [--timeout <seconds>]
@@ -1827,6 +2018,7 @@ Examples:
   ./personalagentkit plant-run first-coder goals/002-next.md
   ./personalagentkit garden
   ./personalagentkit tend
+  ./personalagentkit publish-github
   ./personalagentkit submit --plant first-coder /tmp/my-goal.md
   ./personalagentkit submit --plant explorer --depends-on 012-build-lib --priority 3 --driver codex --model gpt-5.4 /tmp/spike.md
   ./personalagentkit await 013-my-goal
@@ -1854,6 +2046,7 @@ case "${1:-help}" in
   tend)       cmd_tend ;;
   retrospective) cmd_retrospective ;;
   regenesis)  shift; cmd_regenesis "$@" ;;
+  publish-github) shift; cmd_publish_github "$@" ;;
   submit)     shift; cmd_submit "$@" ;;
   await)      shift; cmd_await "$@" ;;
   cycle)      shift; cmd_cycle "$@" ;;

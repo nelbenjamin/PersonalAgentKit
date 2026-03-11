@@ -1,0 +1,5 @@
+config/*.env
+secrets/*.txt
+!config/.gitkeep
+!config/*.example
+!secrets/.gitkeep

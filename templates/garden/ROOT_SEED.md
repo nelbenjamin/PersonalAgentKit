@@ -52,7 +52,7 @@ The coordinator creates a new garden by:
    - `scripts/`, `schema/`, `seeds/`, `superseeds/`, `MOTIVATION.md`,
      `ROOT_SEED.md`, `.gitignore`
    - Empty directories: `memory/`, `goals/`, `runs/`, `plants/`, `skills/`,
-     `horizons/`, `inbox/`
+     `horizons/`, `inbox/`, `config/`
    - Does NOT copy: its own memory, skills, runs, plants, goals, horizons,
      inbox, terroir, or any accumulated state
 2. Writing the new garden's `terroir.md`
@@ -89,6 +89,25 @@ gardens could use, it should publish a copy to shared skills.
 
 New gardens should check `../shared/skills/` during genesis and
 integrate any relevant skills into their workflow.
+
+## Local configuration
+
+Persistent non-secret tool configuration belongs in `config/` within the
+garden that uses it. Keep secrets in `secrets/`; keep discovered ids, local
+tool defaults, and other sourceable environment files in `config/`.
+
+When a skill needs first-use setup, it should write its durable non-secret
+outputs there, for example `config/agentmail.env`, and keep hook-specific
+setup inside the hook bundle or a hook-local companion script instead of
+adding one-off setup commands to `personalagentkit`.
+
+The GitHub publication helper follows the same split:
+- Put durable repository defaults in `config/github.env`.
+- Put the GitHub token in `secrets/github-token.txt`.
+- Run `./scripts/personalagentkit publish-github` to push the current branch
+  to the configured HTTPS remote and open a pull request with `curl`.
+- If `secrets/github-token.txt` is missing or empty, the helper must stay
+  inert: print a clear skip message and exit without prompting.
 
 ## Seeds and superseeds
 

@@ -69,9 +69,11 @@ To reply, write `coordinator/inbox/NNN-reply.md`.
 ## Email (optional)
 
 For email communication, sign up at [agentmail.to](https://agentmail.to)
-and place your API key in `../setup/secrets/agentmail-api-key.txt` before
-running genesis. The agent will find the skill documentation at
-`shared/skills/agentmail.md` and configure itself.
+and place your API key in `secrets/agentmail-api-key.txt` in the garden before
+running `./hooks/setup-agentmail.sh` or first-use Agentmail hooks. The agent
+will find the skill documentation at
+`shared/skills/agentmail.md`, discover or create the shared inbox from the
+Agentmail API, and persist the non-secret result in `config/agentmail.env`.
 
 ## License
 
