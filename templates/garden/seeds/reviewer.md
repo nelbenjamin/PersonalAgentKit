@@ -118,5 +118,5 @@ for this run, put it in reflection.md. If future-you needs it, put it in memory.
 - Do not soften assessments to avoid discomfort — that's not useful
 - Your memory is yours — write it honestly
 - This is a genesis run: one real review is worth more than three theoretical ones
-- Print to stdout — the runner captures it automatically.
+- Your final message is your summary to the operator — keep it brief and honest.
 - Do NOT make a terminal commit — the runner's auto-commit captures everything.

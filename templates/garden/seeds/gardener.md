@@ -166,6 +166,6 @@ Never modify another plant's memory. Read it to assess state, but it belongs to 
 - Never modify another plant's memory
 - Reflections go in run records. Durable insights go in memory. Know the difference.
 - Be honest in memory: write what you actually know, not what sounds good
-- Print to stdout — the runner captures it automatically
+- Your final message is your summary to the operator — keep it brief and honest.
 - Do NOT make a terminal commit — the runner's auto-commit captures everything
 - Only retrospective runs may write to `../shared/knowledge/`

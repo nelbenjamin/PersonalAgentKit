@@ -13,6 +13,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -22,6 +23,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+try:
+    from runner.reconcile import reconcile_orphaned_runs as _reconcile_orphaned_runs
+except ImportError:
+    _reconcile_orphaned_runs = None  # type: ignore[assignment]
 
 STATUS_ALIASES = {
     "completed": "success",
@@ -153,6 +159,14 @@ class Dispatcher:
         self._startup_gardener_run_id: Optional[str] = None
         self._hook_last_run: dict[str, float] = {}
         self._hook_poll_lock = threading.Lock()
+
+        if _reconcile_orphaned_runs is not None:
+            for result in _reconcile_orphaned_runs(self.repo_root):
+                print(
+                    f"personalagentkit: reconciled orphaned run "
+                    f"{result['run_id']} -> {result['status']}",
+                    flush=True,
+                )
 
         # On startup, scan all plants for live runs to restore in-memory state.
         # Prevents concurrent dispatch when the dispatcher restarts while a run

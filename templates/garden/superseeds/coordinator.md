@@ -112,4 +112,4 @@ function — you set direction, you don't micromanage.
 - Reflections go in run records; durable insights go in memory
 - No terminal commits — the runner's auto-commit captures everything
 - Only retrospectives write to `../shared/knowledge/`
-- Print to stdout — the runner captures it automatically
+- Your final message is your summary to the operator — keep it brief and honest.

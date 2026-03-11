@@ -5,7 +5,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from runner.plugin_api import DriverPlugin
+from runner.reflection import goal_type_from_run_dir, reflection_required_for_run
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -218,48 +218,49 @@ def write_run_output(*, run_dir: Path, output: str) -> Path:
     return output_path
 
 
-def classify_goal_type(*, run_dir: Path) -> str:
-    meta_path = run_dir / "meta.json"
-    slug = run_dir.name
-    if meta_path.exists():
-        try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
-        goal_file = data.get("goal_file")
-        if isinstance(goal_file, str) and goal_file:
-            slug = Path(goal_file).stem
+def checkpoint_path(*, run_dir: Path) -> Path:
+    return run_dir / "checkpoint.jsonl"
 
-    normalized_slug = slug.lower()
-    normalized_slug = re.sub(r"^\d+[-_]+", "", normalized_slug)
-    tokens = [token for token in re.split(r"[-_]+", normalized_slug) if token]
-    if not tokens:
-        return "build"
 
-    first_token = tokens[0]
-    last_token = tokens[-1]
+def current_attempt_number(*, run_dir: Path) -> int:
+    prompts = sorted(run_dir.glob("prompt-attempt-*.md"))
+    if not prompts:
+        return 0
 
-    if first_token == "integrate":
-        return "integrate"
-    if first_token == "retrospective":
-        return "retrospective"
-    if first_token == "tend":
-        return "tend"
-    if first_token == "genesis":
-        return "genesis"
-    if first_token == "dispatch":
-        return "dispatch"
-    if first_token == "review":
-        return "review"
-    if first_token == "spike" or last_token == "spike":
-        return "spike"
-    if first_token == "fix":
-        return "fix"
-    return "build"
+    latest = prompts[-1].stem.removeprefix("prompt-attempt-")
+    try:
+        return max(1, int(latest))
+    except ValueError:
+        return len(prompts)
+
+
+def current_attempt_prompt_artifact(*, run_dir: Path) -> str | None:
+    attempt = current_attempt_number(run_dir=run_dir)
+    if attempt <= 0:
+        return None
+    return "prompt-attempt-%02d.md" % attempt
+
+
+def can_resume_from_local_artifacts(*, run_dir: Path) -> bool:
+    prompt_artifact = current_attempt_prompt_artifact(run_dir=run_dir)
+    if prompt_artifact is None:
+        return False
+    return (run_dir / prompt_artifact).is_file()
+
+
+def append_checkpoint(*, run_dir: Path, event: str, **payload: Any) -> None:
+    record = {
+        "ts": utc_now_iso(),
+        "event": event,
+        "attempt": current_attempt_number(run_dir=run_dir),
+    }
+    record.update(payload)
+    with checkpoint_path(run_dir=run_dir).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def reflection_required(*, run_dir: Path, status: str) -> bool:
-    return status == "success" and classify_goal_type(run_dir=run_dir) in {"build", "fix", "review"}
+    return reflection_required_for_run(run_dir, status)
 
 
 def ensure_reflection_artifact(*, run_dir: Path, status: str, output: str) -> str | None:
@@ -270,7 +271,13 @@ def ensure_reflection_artifact(*, run_dir: Path, status: str, output: str) -> st
     if reflection_path.is_file():
         return None
 
-    print(f"personalagentkit: WARNING: reflection.md missing from {run_dir.name}", file=sys.stderr, flush=True)
+    goal_type = goal_type_from_run_dir(run_dir)
+    print(
+        f"personalagentkit: WARNING: reflection.md missing from {run_dir.name} "
+        f"(required for successful {goal_type} runs)",
+        file=sys.stderr,
+        flush=True,
+    )
     return None
 
 
@@ -306,6 +313,8 @@ def finalize_run_artifacts(
     exit_code: int | None = None,
     watchdog_killed: bool = False,
     completed_at: str | None = None,
+    forced_status: str | None = None,
+    notes: str | None = None,
 ) -> dict[str, Any]:
     plugins = available_plugins()
     plugin = plugins.get(driver)
@@ -317,7 +326,9 @@ def finalize_run_artifacts(
     events = parse_events(events_path)
     normalized = enrich_normalized_result(plugin.parse_events(events=events, model=model))
 
-    if watchdog_killed or any(event.get("type") == "watchdog_killed" for event in events):
+    if forced_status is not None:
+        status = forced_status
+    elif watchdog_killed or any(event.get("type") == "watchdog_killed" for event in events):
         status = "killed"
     elif exit_code is not None:
         status = "success" if exit_code == 0 else "failure"
@@ -344,13 +355,78 @@ def finalize_run_artifacts(
             "stderr_path": str(run_dir / "stderr.txt"),
         }
     )
+    if notes is not None:
+        normalized["notes"] = notes
 
     ensure_reflection_artifact(run_dir=run_dir, status=status, output=normalized["output"])
 
     if normalized["status"] != "running":
         update_run_meta(run_dir=run_dir, normalized=normalized, completed_at=resolved_completed_at)
+        append_checkpoint(
+            run_dir=run_dir,
+            event="finalized",
+            status=normalized["status"],
+            completed_at=resolved_completed_at,
+            cost=normalized["cost"],
+            num_turns=normalized["num_turns"],
+            duration_ms=normalized["duration_ms"],
+            notes=normalized.get("notes"),
+        )
+        if normalized["status"] == "killed":
+            prompt_artifact = current_attempt_prompt_artifact(run_dir=run_dir)
+            if prompt_artifact is not None and (run_dir / prompt_artifact).is_file():
+                append_checkpoint(
+                    run_dir=run_dir,
+                    event="ready_to_resume",
+                    basis="local-artifacts",
+                    provider_session_continuation=False,
+                    preserved_artifacts=[
+                        "checkpoint.jsonl",
+                        "meta.json",
+                        prompt_artifact,
+                        "events.jsonl",
+                        "stderr.txt",
+                    ],
+                    recomputed_artifacts=["events.jsonl", "_stdout.md", "stderr.txt"],
+                )
+            else:
+                append_checkpoint(
+                    run_dir=run_dir,
+                    event="resume_unavailable",
+                    reason="missing-prompt-artifact",
+                    provider_session_continuation=False,
+                )
 
     return normalized
+
+
+def recover_run(
+    *,
+    driver: str,
+    model: str,
+    run_dir: Path,
+    finalize_orphaned: bool = False,
+    orphaned_note: str | None = None,
+) -> dict[str, Any]:
+    result = finalize_run_artifacts(
+        driver=driver,
+        model=model,
+        run_dir=run_dir,
+    )
+    if result["status"] != "running" or not finalize_orphaned:
+        result["recoverable"] = result["status"] == "killed" and can_resume_from_local_artifacts(run_dir=run_dir)
+        return result
+
+    result = finalize_run_artifacts(
+        driver=driver,
+        model=model,
+        run_dir=run_dir,
+        completed_at=utc_now_iso(),
+        forced_status="killed",
+        notes=orphaned_note,
+    )
+    result["recoverable"] = can_resume_from_local_artifacts(run_dir=run_dir)
+    return result
 
 
 def run_with_watchdog(
@@ -366,6 +442,14 @@ def run_with_watchdog(
     poll_interval = 1.0
     events_path.parent.mkdir(parents=True, exist_ok=True)
     with events_path.open("a", encoding="utf-8") as events_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
+        append_checkpoint(
+            run_dir=events_path.parent,
+            event="provider_invoked",
+            command=command,
+            events_path=str(events_path),
+            stderr_path=str(stderr_path),
+            provider_session_continuation=False,
+        )
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -391,18 +475,35 @@ def run_with_watchdog(
                 last_change = time.monotonic()
 
             if exit_code is not None:
+                append_checkpoint(
+                    run_dir=events_path.parent,
+                    event="provider_exited",
+                    exit_code=exit_code,
+                    watchdog_killed=watchdog_killed,
+                )
                 return exit_code, watchdog_killed
 
             if time.monotonic() - last_change >= idle_timeout:
                 watchdog_killed = True
                 events_handle.write('{"type":"watchdog_killed","reason":"no events for %ss"}\n' % idle_timeout)
                 events_handle.flush()
+                append_checkpoint(
+                    run_dir=events_path.parent,
+                    event="watchdog_killed",
+                    idle_timeout=idle_timeout,
+                )
                 process.terminate()
                 try:
                     exit_code = process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     exit_code = process.wait()
+                append_checkpoint(
+                    run_dir=events_path.parent,
+                    event="provider_exited",
+                    exit_code=exit_code,
+                    watchdog_killed=watchdog_killed,
+                )
                 return exit_code, watchdog_killed
 
             time.sleep(poll_interval)
@@ -460,6 +561,8 @@ def build_parser() -> argparse.ArgumentParser:
     recover_parser.add_argument("--driver", required=True)
     recover_parser.add_argument("--model", required=True)
     recover_parser.add_argument("--run-dir", required=True)
+    recover_parser.add_argument("--finalize-orphaned", action="store_true")
+    recover_parser.add_argument("--orphaned-note", default=None)
 
     return parser
 
@@ -501,12 +604,13 @@ def main() -> int:
         return 0
 
     if args.command == "recover":
-        result = finalize_run_artifacts(
+        result = recover_run(
             driver=args.driver,
             model=args.model,
             run_dir=Path(args.run_dir),
+            finalize_orphaned=args.finalize_orphaned,
+            orphaned_note=args.orphaned_note,
         )
-        result["recoverable"] = result["status"] != "running"
         print(json.dumps(result))
         return 0
 

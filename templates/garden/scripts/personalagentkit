@@ -13,7 +13,7 @@
 #   P2: meta.json is schema-validated structure
 #   P5: every run produces a record before the agent speaks
 #   P6: cost fields are required in meta.json at completion
-#   P7: agent is prompted to write reflection.md
+#   P7: reflection obligations are recorded in meta.json and stated in the prompt
 
 set -euo pipefail
 
@@ -270,6 +270,35 @@ classify_goal_type() {
   esac
 }
 
+goal_type_requires_reflection() {
+  case "${1:-}" in
+    build|fix|review|tend|retrospective) echo "true" ;;
+    *) echo "false" ;;
+  esac
+}
+
+reflection_contract_prompt() {
+  local goal_type="${1:-build}"
+  local requires_reflection="${2:-false}"
+  if [[ "$requires_reflection" == "true" ]]; then
+    cat <<EOF
+
+# Reflection Contract
+
+This run is classified as a \`$goal_type\` run.
+If it succeeds, you must write \`reflection.md\` in the run directory before exiting.
+EOF
+  else
+    cat <<EOF
+
+# Reflection Contract
+
+This run is classified as a \`$goal_type\` run.
+\`reflection.md\` is not required by the run ledger contract for this run type unless the goal text explicitly asks for it.
+EOF
+  fi
+}
+
 parse_goal_meta() {
   # Usage: parse_goal_meta <goal-file> <field>
   # field: assigned_to | depends_on | submitted_by | driver | model
@@ -343,6 +372,260 @@ is_dep_satisfied() {
   return 1
 }
 
+current_attempt_number() {
+  local run_dir="$1"
+  local prompt_file last
+  last=""
+  shopt -s nullglob
+  for prompt_file in "$run_dir"/prompt-attempt-*.md; do
+    last="$prompt_file"
+  done
+  shopt -u nullglob
+  if [[ -z "$last" ]]; then
+    echo 0
+    return
+  fi
+
+  local stem="${last##*/prompt-attempt-}"
+  stem="${stem%.md}"
+  [[ "$stem" =~ ^[0-9]+$ ]] && echo $((10#$stem)) || echo 0
+}
+
+next_attempt_number() {
+  local run_dir="$1"
+  echo $(( $(current_attempt_number "$run_dir") + 1 ))
+}
+
+attempt_label() {
+  printf "%02d" "$1"
+}
+
+prompt_artifact_path() {
+  local run_dir="$1" attempt="$2"
+  printf '%s/prompt-attempt-%s.md\n' "$run_dir" "$(attempt_label "$attempt")"
+}
+
+append_checkpoint() {
+  local run_dir="$1" event="$2" note="${3:-}"
+  jq -cn \
+    --arg ts "$(iso_now)" \
+    --arg event "$event" \
+    --argjson attempt "$(current_attempt_number "$run_dir")" \
+    --arg note "$note" \
+    '{ts: $ts, event: $event, attempt: $attempt}
+     | if $note != "" then . + {note: $note} else . end' >> "$run_dir/checkpoint.jsonl"
+}
+
+build_run_prompt() {
+  local goal_file="$1" base_dir="$2" goal_type="$3" requires_reflection="$4" extra_context="${5:-}"
+  local motivation goal_content memory_section
+  motivation=$(cat "$base_dir/MOTIVATION.md")
+  goal_content=$(cat "$REPO_ROOT/$goal_file")
+
+  memory_section=""
+  if [[ -f "$base_dir/memory/MEMORY.md" ]]; then
+    local memory_content
+    memory_content=$(cat "$base_dir/memory/MEMORY.md")
+    memory_section=$(cat <<MEMORY
+
+---
+
+# Memory
+
+$memory_content
+MEMORY
+)
+  fi
+
+  cat <<PROMPT
+You are a capable agent working on a goal within the PersonalAgentKit system.
+
+# Motivation
+
+$motivation
+$memory_section
+
+---
+
+# Goal
+
+$goal_content
+$(reflection_contract_prompt "$goal_type" "$requires_reflection")
+$extra_context
+
+---
+
+Your working directory is $base_dir. Begin.
+PROMPT
+}
+
+write_prompt_artifact() {
+  local run_dir="$1" attempt="$2" prompt="$3"
+  local prompt_path
+  prompt_path=$(prompt_artifact_path "$run_dir" "$attempt")
+  printf '%s\n' "$prompt" > "$prompt_path"
+}
+
+find_run_dir_by_id() {
+  local run_id="$1"
+  local candidate
+  for candidate in "$REPO_ROOT/runs/$run_id" "$REPO_ROOT/plants"/*/runs/"$run_id"; do
+    [[ -d "$candidate" && -f "$candidate/meta.json" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+archive_attempt_artifacts() {
+  local run_dir="$1" attempt="$2"
+  local archive_dir="$run_dir/attempts/attempt-$(attempt_label "$attempt")"
+  mkdir -p "$archive_dir"
+
+  local artifact
+  for artifact in events.jsonl _stdout.md stderr.txt meta.json; do
+    [[ -f "$run_dir/$artifact" ]] || continue
+    cp "$run_dir/$artifact" "$archive_dir/$artifact"
+    [[ "$artifact" == "meta.json" ]] || rm -f "$run_dir/$artifact"
+  done
+
+  local prompt_path
+  prompt_path=$(prompt_artifact_path "$run_dir" "$attempt")
+  [[ -f "$prompt_path" ]] && cp "$prompt_path" "$archive_dir/$(basename "$prompt_path")"
+
+  printf '%s\n' "$archive_dir"
+}
+
+resume_context_block() {
+  local run_dir="$1" prior_attempt="$2" archive_dir="$3"
+  local latest_checkpoint prior_status prior_cost
+  latest_checkpoint=$(tail -n 1 "$run_dir/checkpoint.jsonl" 2>/dev/null || true)
+  prior_status=$(jq -r '.status // "unknown"' "$archive_dir/meta.json" 2>/dev/null)
+  prior_cost=$(preferred_cost_from_meta "$archive_dir/meta.json")
+
+  cat <<EOF
+
+## Resume Context
+
+This run is being resumed from local artifacts after attempt $(attempt_label "$prior_attempt") ended with status \`$prior_status\`.
+
+- Resume basis: local artifacts only
+- Provider session continuation: none
+- Fresh provider call required: yes
+- Preserved artifacts: \`checkpoint.jsonl\`, \`attempts/attempt-$(attempt_label "$prior_attempt")/\`, prior prompt artifact
+- Recomputed artifacts for this attempt: \`events.jsonl\`, \`_stdout.md\`, \`stderr.txt\`
+- Current workspace basis: whatever is now present on disk in the working directory
+- Prior visible cost: $prior_cost USD
+- Latest checkpoint record: \`$latest_checkpoint\`
+
+Continue from the preserved local state. Do not claim to have resumed hidden provider state. If earlier work is uncertain or incomplete, say what was preserved and what you are recomputing in this fresh call.
+EOF
+}
+
+reset_meta_for_resume() {
+  local meta="$1" resumed_at="$2" prior_attempt="$3"
+  jq \
+    --arg resumed_at "$resumed_at" \
+    --argjson prior_attempt "$prior_attempt" \
+    '.status = "running"
+   | .completed_at = null
+   | .cost = null
+   | .outputs = []
+   | .notes = ("Resumed from attempt " + ($prior_attempt|tostring) + " using local artifacts only; provider session continuation = false.")
+   | .num_turns = null
+   | .duration_ms = null
+   | .resume_count = ((.resume_count // 0) + 1)
+   | .last_resumed_at = $resumed_at
+   | .resumed_from_attempt = $prior_attempt
+   | .resume_strategy = "fresh-provider-call-from-local-artifacts"' \
+    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
+}
+
+write_resume_artifact() {
+  local run_dir="$1" prior_attempt="$2" archive_dir="$3"
+  local prior_cost total_cost status last_attempt_cost
+  prior_cost=$(preferred_cost_from_meta "$archive_dir/meta.json")
+  total_cost=$(preferred_cost_from_meta "$run_dir/meta.json")
+  last_attempt_cost=$(jq -r '
+    (.last_attempt_cost.actual_usd // .last_attempt_cost.estimated_usd // empty)
+    | if . == "" then "0.0000" else tostring end
+  ' "$run_dir/meta.json" 2>/dev/null)
+  status=$(jq -r '.status // "unknown"' "$run_dir/meta.json" 2>/dev/null)
+
+  cat > "$run_dir/resume.md" <<EOF
+# Resumption Record
+
+- Basis: local artifacts only
+- Provider continuation: fresh call
+- Preserved from attempt $(attempt_label "$prior_attempt"): \`$archive_dir\`, \`checkpoint.jsonl\`, \`prompt-attempt-$(attempt_label "$prior_attempt").md\`
+- Recomputed on resumed attempt: \`events.jsonl\`, \`_stdout.md\`, \`stderr.txt\`
+- Cost before resumption: $prior_cost USD
+- Cost for resumed attempt only: $last_attempt_cost USD
+- Cumulative cost after resumption: $total_cost USD
+- Final status after resumed attempt: \`$status\`
+EOF
+}
+
+build_cumulative_driver_result() {
+  local run_dir="$1" driver_result_json="$2"
+  local attempt_meta
+  local -a archived_meta_files=()
+  shopt -s nullglob
+  for attempt_meta in "$run_dir"/attempts/attempt-*/meta.json; do
+    archived_meta_files+=("$attempt_meta")
+  done
+  shopt -u nullglob
+
+  if [[ ${#archived_meta_files[@]} -eq 0 ]]; then
+    jq -cn --argjson current "$driver_result_json" '
+      {
+        completed_attempts: 1,
+        cost: $current.cost,
+        num_turns: $current.num_turns,
+        duration_ms: $current.duration_ms,
+        last_attempt_cost: $current.cost,
+        last_attempt_num_turns: $current.num_turns,
+        last_attempt_duration_ms: $current.duration_ms
+      }
+    '
+    return
+  fi
+
+  jq -s --argjson current "$driver_result_json" '
+    def sum_cost(field; current_value):
+      ((map(.cost[field] // 0) | add) // 0) + (current_value // 0);
+    def sum_scalar(field; current_value):
+      ((map(.[field] // 0) | add) // 0) + (current_value // 0);
+    def combined_notes(base; count):
+      if count <= 1 then base
+      elif (base // "") == "" then
+        "Cumulative across " + (count | tostring) + " attempts; per-attempt artifacts are preserved under attempts/."
+      else
+        base + " Cumulative across " + (count | tostring) + " attempts; per-attempt artifacts are preserved under attempts/."
+      end;
+    . as $archived
+    | (($archived | length) + 1) as $attempt_count
+    | ($current.cost.pricing // {}) as $pricing
+    | {
+        completed_attempts: $attempt_count,
+        cost: {
+          input_tokens: sum_cost("input_tokens"; $current.cost.input_tokens),
+          output_tokens: sum_cost("output_tokens"; $current.cost.output_tokens),
+          cache_read_tokens: sum_cost("cache_read_tokens"; $current.cost.cache_read_tokens),
+          cache_write_tokens: sum_cost("cache_write_tokens"; $current.cost.cache_write_tokens),
+          actual_usd: sum_cost("actual_usd"; $current.cost.actual_usd),
+          estimated_usd: sum_cost("estimated_usd"; $current.cost.estimated_usd),
+          pricing: ($pricing + {notes: combined_notes($pricing.notes; $attempt_count)})
+        },
+        num_turns: sum_scalar("num_turns"; $current.num_turns),
+        duration_ms: sum_scalar("duration_ms"; $current.duration_ms),
+        last_attempt_cost: $current.cost,
+        last_attempt_num_turns: $current.num_turns,
+        last_attempt_duration_ms: $current.duration_ms
+      }
+  ' "${archived_meta_files[@]}"
+}
+
 # ── agent invocation ──────────────────────────────────────────────────────────
 #
 # invoke_agent <run_dir> <prompt>
@@ -354,10 +637,12 @@ is_dep_satisfied() {
 invoke_agent() {
   local run_dir="$1"
   local prompt="$2"
+  local idle_timeout="${PAK_IDLE_TIMEOUT:-600}"
   DRIVER_RESULT_JSON=$(cd "$REPO_ROOT" && printf "%s" "$prompt" | python3 -m runner.host invoke \
     --driver "$PAK_DRIVER" \
     --model "$_driver_model" \
-    --run-dir "$run_dir") || die "driver invocation failed"
+    --run-dir "$run_dir" \
+    --idle-timeout "$idle_timeout") || die "driver invocation failed"
   AGENT_STATUS=$(echo "$DRIVER_RESULT_JSON" | jq -r '.status')
 }
 
@@ -369,17 +654,25 @@ persist_driver_result_to_meta() {
   completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
   [[ -n "$completed_at" ]] || completed_at=$(iso_now)
 
+  local cumulative_json
+  cumulative_json=$(build_cumulative_driver_result "$run_dir" "$driver_result_json")
+
   local outputs='[]'
   [[ -f "$run_dir/reflection.md" ]] && outputs='["reflection.md"]'
   jq \
     --arg completed     "$completed_at" \
     --argjson driver_result "$driver_result_json" \
+    --argjson cumulative "$cumulative_json" \
     --argjson outputs   "$outputs" \
     '.completed_at = (if (.completed_at | type) == "string" and .completed_at != "" then .completed_at else $completed end)
    | .status      = $driver_result.status
-   | .cost        = $driver_result.cost
-   | .num_turns   = $driver_result.num_turns
-   | .duration_ms = $driver_result.duration_ms
+   | .cost        = $cumulative.cost
+   | .num_turns   = $cumulative.num_turns
+   | .duration_ms = $cumulative.duration_ms
+   | .completed_attempts = $cumulative.completed_attempts
+   | .last_attempt_cost = $cumulative.last_attempt_cost
+   | .last_attempt_num_turns = $cumulative.last_attempt_num_turns
+   | .last_attempt_duration_ms = $cumulative.last_attempt_duration_ms
    | .outputs     = $outputs
    | del(.zombie_cleaned_at, .zombie_note)' \
     "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
@@ -431,6 +724,10 @@ cmd_run() {
   local started_at
   started_at=$(iso_now)
 
+  local goal_type requires_reflection
+  goal_type=$(classify_goal_type "$goal_id")
+  requires_reflection=$(goal_type_requires_reflection "$goal_type")
+
   # ── write initial run record (P5: record before agent acts) ──────────────
   local submitted_by="${TELOS_SUBMITTED_BY:-}"
   jq -n \
@@ -441,6 +738,8 @@ cmd_run() {
     --arg model        "$_driver_model" \
     --arg agent        "${_driver_model:-$PAK_DRIVER}" \
     --arg submitted_by "$submitted_by" \
+    --arg goal_type    "$goal_type" \
+    --argjson requires_reflection "$requires_reflection" \
     '{
       run_id:     $run_id,
       goal_file:  $goal_file,
@@ -450,6 +749,8 @@ cmd_run() {
       driver:     $driver,
       model:      $model,
       agent:      $agent,
+      goal_type:  $goal_type,
+      requires_reflection: $requires_reflection,
       cost:       null,
       outputs:    [],
       notes:      null
@@ -458,47 +759,12 @@ cmd_run() {
   echo "personalagentkit: run $goal_id started at $started_at"
   echo "personalagentkit: record → $meta"
 
-  # ── build the prompt ──────────────────────────────────────────────────────
-  local motivation
-  motivation=$(cat "$base_dir/MOTIVATION.md")
-  local goal_content
-  goal_content=$(cat "$REPO_ROOT/$goal_file")
-
-  local memory_section=""
-  if [[ -f "$base_dir/memory/MEMORY.md" ]]; then
-    local memory_content
-    memory_content=$(cat "$base_dir/memory/MEMORY.md")
-    memory_section=$(cat <<MEMORY
-
----
-
-# Memory
-
-$memory_content
-MEMORY
-)
-  fi
-
-  local prompt
-  prompt=$(cat <<PROMPT
-You are a capable agent working on a goal within the PersonalAgentKit system.
-
-# Motivation
-
-$motivation
-$memory_section
-
----
-
-# Goal
-
-$goal_content
-
----
-
-Your working directory is $base_dir. Begin.
-PROMPT
-)
+  # ── build the prompt and write prompt artifact ────────────────────────────
+  local attempt prompt
+  attempt=$(next_attempt_number "$run_dir")
+  prompt=$(build_run_prompt "$goal_file" "$base_dir" "$goal_type" "$requires_reflection")
+  write_prompt_artifact "$run_dir" "$attempt" "$prompt"
+  append_checkpoint "$run_dir" "started" "goal=$goal_file driver=$PAK_DRIVER model=$_driver_model"
 
   # ── invoke agent, stream events to events.jsonl ───────────────────────────
   invoke_agent "$run_dir" "$prompt"
@@ -537,7 +803,7 @@ PROMPT
     done <<< "$validation_errors"
   fi
 
-  if [[ ! -f "$run_dir/reflection.md" ]]; then
+  if [[ "$requires_reflection" == "true" && ! -f "$run_dir/reflection.md" ]]; then
     echo "personalagentkit: WARNING: reflection.md missing from $run_dir" >&2
   fi
 
@@ -562,6 +828,8 @@ cmd_status() {
   local runs_dir="$REPO_ROOT/runs"
   local now_epoch
   now_epoch=$(date +%s)
+
+  python3 -m runner.reconcile --root "$REPO_ROOT" >/dev/null 2>&1 || true
 
   # ── in-flight runs (root + all plants) shown first ─────────────────────────
   local running_found=false
@@ -681,6 +949,34 @@ cmd_status() {
   done
 
   printf "\n%s\n" "$(legacy_status_summary)"
+
+  printf "\nHEALTH\n"
+  (
+    cd "$REPO_ROOT"
+    python3 - "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+from runner.health import get_health_issues
+from runner.reflection import reflection_policy_summary
+
+repo_root = Path(sys.argv[1])
+missing, stale, active, pending = get_health_issues(repo_root, stale_threshold_secs=7200)
+
+print(f"  {reflection_policy_summary()}")
+if not missing and not stale and not active and not pending:
+    print("  all clear")
+else:
+    for item in stale:
+        print(f"  {item}  stale")
+    for item in active:
+        print(f"  {item}  running")
+    for item in missing:
+        print(f"  {item}  missing reflection")
+    for plant, count in pending.items():
+        print(f"  {plant}  {count} pending goals")
+PY
+  )
 }
 
 cmd_plant() {
@@ -709,21 +1005,26 @@ cmd_plant() {
 
   local run_dir="$plant_dir/runs/000-genesis"
   local meta="$run_dir/meta.json"
-  local output="$run_dir/_stdout.md"
   local started_at
   started_at=$(iso_now)
+
+  local goal_type="genesis"
+  local requires_reflection="false"
 
   echo "personalagentkit: planting $plant_name from seed $seed_name"
   echo "personalagentkit: plant dir → $plant_dir"
 
   # ── write initial run record ─────────────────────────────────────────────
+  local genesis_goal_file="plants/$plant_name/goals/000-genesis.md"
   jq -n \
     --arg run_id    "000-genesis" \
-    --arg goal_file "goals/000-genesis.md" \
+    --arg goal_file "$genesis_goal_file" \
     --arg started   "$started_at" \
     --arg driver    "$PAK_DRIVER" \
     --arg model     "$_driver_model" \
     --arg agent     "${_driver_model:-$PAK_DRIVER}" \
+    --arg goal_type "$goal_type" \
+    --argjson requires_reflection "$requires_reflection" \
     '{
       run_id:     $run_id,
       goal_file:  $goal_file,
@@ -733,36 +1034,19 @@ cmd_plant() {
       driver:     $driver,
       model:      $model,
       agent:      $agent,
+      goal_type:  $goal_type,
+      requires_reflection: $requires_reflection,
       cost:       null,
       outputs:    [],
       notes:      null
     }' > "$meta"
 
-  # ── build the prompt ──────────────────────────────────────────────────────
-  local motivation
-  motivation=$(cat "$plant_dir/MOTIVATION.md")
-  local goal_content
-  goal_content=$(cat "$plant_dir/goals/000-genesis.md")
-
-  local prompt
-  prompt=$(cat <<PROMPT
-You are a capable agent working on a goal within the PersonalAgentKit system.
-
-# Motivation
-
-$motivation
-
----
-
-# Goal
-
-$goal_content
-
----
-
-Your working directory is $plant_dir. Begin.
-PROMPT
-)
+  # ── build the prompt and write prompt artifact ────────────────────────────
+  local attempt prompt
+  attempt=$(next_attempt_number "$run_dir")
+  prompt=$(build_run_prompt "$genesis_goal_file" "$plant_dir" "$goal_type" "$requires_reflection")
+  write_prompt_artifact "$run_dir" "$attempt" "$prompt"
+  append_checkpoint "$run_dir" "started" "goal=$genesis_goal_file driver=$PAK_DRIVER model=$_driver_model"
 
   # ── invoke agent, stream events to events.jsonl ───────────────────────────
   invoke_agent "$run_dir" "$prompt"
@@ -773,7 +1057,7 @@ PROMPT
   local completed_at
   completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
 
-  if [[ ! -f "$run_dir/reflection.md" ]]; then
+  if [[ "$requires_reflection" == "true" && ! -f "$run_dir/reflection.md" ]]; then
     echo "personalagentkit: WARNING: reflection.md missing from $run_dir" >&2
   fi
 
@@ -968,9 +1252,9 @@ reflections about reflections creates a closed loop that produces no value.
 ## Produce outputs
 
 Every tend run:
-1. Print a short summary (10–20 lines) to stdout — the runner captures it automatically
-2. Write `reflection.md` to the run directory — what did tending reveal?
-3. Update `memory/MEMORY.md` if this tend revealed durable insights
+1. Write `reflection.md` to the run directory — what did tending reveal?
+2. Update `memory/MEMORY.md` if this tend revealed durable insights
+3. Your final message is your summary to the operator — include what you tended and what to watch
 
 Do NOT make a terminal commit — the runner's auto-commit captures everything.
 TEND
@@ -1048,19 +1332,18 @@ or update memory. Focus on observation, analysis, and shared knowledge.
    **Date:** YYYY-MM-DD
    ```
    Delete or update any stale facts already there.
-7. Print a 20–40 line synthesis to stdout structured as:
+7. Write `reflection.md` to the run directory.
+8. Your final message is your synthesis to the operator, structured as:
    - **Surprises** — what was unexpected
    - **Patterns** — what keeps happening
    - **Strategy** — assessment of current direction
    - **Actions** — what the next tend should consider (but do NOT write goals)
-8. Write `reflection.md` to the run directory.
 
 ## Constraints
 
 - Do NOT write goals — that's what tends do
 - Do NOT update plant memory or root memory — observe only
 - Do NOT make a terminal commit — the runner's auto-commit captures everything
-- Print to stdout — the runner captures it automatically
 - Read broadly: the value of a retrospective is seeing what individual tends miss
 RETRO
 
@@ -1130,7 +1413,7 @@ assigned_to: $plant_name
 Your seed has been updated. Integrate the changes into your memory without
 losing your accumulated knowledge or identity.
 - Do NOT make a terminal commit — the runner's auto-commit captures everything
-- Print to stdout — the runner captures it automatically
+- Your final message is your summary to the operator — what changed and what carried over
 
 ## Current seed content
 
@@ -1585,13 +1868,12 @@ goal stubs that the next cycle can execute.
    - Find the next available NNN by scanning `goals/` and `runs/`
    - Write `goals/NNN-<slug>.md` with a brief goal description
    - These become real goals the cycle will pick up and run
-6. Print a short summary to stdout — include which goal stubs were written.
+6. Your final message is your summary to the operator — include which goal stubs were written.
 
 ## Definition of done
 
 - `memory/retrospective.md` updated with a dated section
 - Up to 3 goal stubs written to `goals/NNN-*.md`
-- stdout summary printed
 
 ## Constraints
 
@@ -1600,7 +1882,6 @@ goal stubs that the next cycle can execute.
 - Don't write a stub for "do another retrospective" — that happens automatically
 - **Do NOT make a terminal commit** with a message like `run {id}: finalize`. The runner
   commits everything after you exit. Use descriptive intermediate commits only.
-- Print your summary to stdout — the runner captures it automatically.
 RETRO
 
   echo "telos: running post-cycle retrospective → $retro_file"
@@ -1959,6 +2240,71 @@ cmd_resume() {
   echo "telos: sentinels cleared"
 }
 
+cmd_resume_run() {
+  local run_id="${1:-}"
+  [[ -n "$run_id" ]] || die "usage: personalagentkit resume-run <run-id>"
+
+  require python3
+  require jq
+
+  local run_dir
+  run_dir=$(find_run_dir_by_id "$run_id") || die "run not found: $run_id"
+  local meta="$run_dir/meta.json"
+  local status
+  status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+  status=$(normalize_status "$status")
+  [[ "$status" == "killed" ]] || die "resume-run currently only supports killed runs; found status: $status"
+
+  local goal_file driver model goal_type requires_reflection base_dir
+  goal_file=$(jq -r '.goal_file // empty' "$meta" 2>/dev/null)
+  driver=$(jq -r '.driver // empty' "$meta" 2>/dev/null)
+  model=$(jq -r '.model // empty' "$meta" 2>/dev/null)
+  goal_type=$(jq -r '.goal_type // "build"' "$meta" 2>/dev/null)
+  requires_reflection=$(jq -r '.requires_reflection // false' "$meta" 2>/dev/null)
+
+  [[ -n "$goal_file" && -f "$REPO_ROOT/$goal_file" ]] || die "goal file missing for run: $goal_file"
+  [[ -n "$driver" && -n "$model" ]] || die "run meta missing driver/model: $run_id"
+
+  resolve_driver_config "$driver" "$model"
+  require "$_driver_bin"
+
+  if [[ "$run_dir" == "$REPO_ROOT/plants/"*"/runs/"* ]]; then
+    base_dir="$(dirname "$(dirname "$run_dir")")"
+  else
+    base_dir="$REPO_ROOT"
+  fi
+
+  local prior_attempt archive_dir resumed_at attempt prompt
+  prior_attempt=$(current_attempt_number "$run_dir")
+  [[ "$prior_attempt" -gt 0 ]] || die "cannot resume run without an existing attempt prompt artifact: $run_id"
+
+  archive_dir=$(archive_attempt_artifacts "$run_dir" "$prior_attempt")
+  resumed_at=$(iso_now)
+  reset_meta_for_resume "$meta" "$resumed_at" "$prior_attempt"
+
+  attempt=$(next_attempt_number "$run_dir")
+  prompt=$(build_run_prompt \
+    "$goal_file" \
+    "$base_dir" \
+    "$goal_type" \
+    "$requires_reflection" \
+    "$(resume_context_block "$run_dir" "$prior_attempt" "$archive_dir")")
+  write_prompt_artifact "$run_dir" "$attempt" "$prompt"
+  append_checkpoint "$run_dir" "resumed" "prior_attempt=$(attempt_label "$prior_attempt") basis=local-artifacts provider_continuation=false"
+
+  invoke_agent "$run_dir" "$prompt"
+  local driver_result_json="$DRIVER_RESULT_JSON"
+  local completed_at
+
+  persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
+  completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
+  write_resume_artifact "$run_dir" "$prior_attempt" "$archive_dir"
+
+  echo "personalagentkit: resumed run $run_id as attempt $(attempt_label "$attempt")"
+  echo "personalagentkit: completed at $completed_at with status $(jq -r '.status' "$meta")"
+  echo "personalagentkit: resumption record → $run_dir/resume.md"
+}
+
 cmd_help() {
   cat <<'HELP'
 personalagentkit — minimal goal runner
@@ -1976,6 +2322,7 @@ Commands:
   retrospective              Write a retrospective goal for gardener and run it
   regenesis <plant> [seed]   Re-inject updated seed into a plant's memory
   publish-github             Push the current branch and open a pull request via config/github.env
+  resume-run <run-id>        Resume a killed run from local artifacts with a fresh provider call
   submit [--plant <name>] [--depends-on <slug,...>] [--priority N] [--driver D] [--model M] <goal-file>
                              Write a goal to goals/ with frontmatter; exits immediately
   await <goal-id> [--timeout <seconds>]
@@ -1996,8 +2343,9 @@ Run records (runs/NNN-slug/):
   _stdout.md       Final agent text output extracted from the result event
   stderr.txt      stderr from the claude process
 
-  status: killed  Set when the 60-second no-event watchdog fires; partial cost data preserved
+  status: killed  Set when the no-event watchdog fires; partial cost data preserved
   legacy read-compat: completed->success, failed->failure; new runs write only canonical statuses
+  New runs also record goal_type and requires_reflection so reflection obligations are explicit.
 
 Goal frontmatter (optional YAML block at top of goal file):
   ---
@@ -2047,6 +2395,7 @@ case "${1:-help}" in
   retrospective) cmd_retrospective ;;
   regenesis)  shift; cmd_regenesis "$@" ;;
   publish-github) shift; cmd_publish_github "$@" ;;
+  resume-run) shift; cmd_resume_run "$@" ;;
   submit)     shift; cmd_submit "$@" ;;
   await)      shift; cmd_await "$@" ;;
   cycle)      shift; cmd_cycle "$@" ;;

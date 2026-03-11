@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 # Matches the stale threshold in ./telos status (telos line 272: elapsed > 7200)
 STALE_THRESHOLD_SECS = 7200
 
@@ -143,6 +145,12 @@ def status_label(meta):
 
 
 def main():
+    try:
+        from runner.reconcile import reconcile_orphaned_runs
+        reconcile_orphaned_runs(TELOS_ROOT)
+    except ImportError:
+        pass
+
     root_runs = load_runs()
     all_runs = load_all_runs()
     if not all_runs:
@@ -251,7 +259,20 @@ def get_health_issues():
 
     stale_runs: status==running and age > STALE_THRESHOLD_SECS (or no age info)
     active_runs: status==running and age <= STALE_THRESHOLD_SECS
+    missing_reflections: successful runs with requires_reflection=true and no reflection.md
     """
+    try:
+        from runner.health import get_health_issues as _get_health_issues
+        missing, stale, active, pending = _get_health_issues(
+            TELOS_ROOT, stale_threshold_secs=STALE_THRESHOLD_SECS
+        )
+        return missing, stale, active, pending
+    except ImportError:
+        pass
+
+    # Fallback: legacy behavior if runner.health is not available
+    from runner.reflection import reflection_required_for_run
+
     missing_reflections = []
     stale_runs = []
     active_runs = []
@@ -276,7 +297,7 @@ def get_health_issues():
                 else:
                     active_runs.append(f"root/{run_dir.name}")
                 continue
-            if not (run_dir / "reflection.md").exists():
+            if reflection_required_for_run(run_dir, status) and not (run_dir / "reflection.md").exists():
                 missing_reflections.append(f"root/{run_dir.name}")
 
     if PLANTS_DIR.is_dir():
@@ -303,7 +324,7 @@ def get_health_issues():
                     else:
                         active_runs.append(f"{plant_dir.name}/{run_dir.name}")
                     continue
-                if not (run_dir / "reflection.md").exists():
+                if reflection_required_for_run(run_dir, status) and not (run_dir / "reflection.md").exists():
                     missing_reflections.append(f"{plant_dir.name}/{run_dir.name}")
 
     pending_by_plant = {}

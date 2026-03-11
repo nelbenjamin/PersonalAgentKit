@@ -126,6 +126,6 @@ for this run, put it in reflection.md. If future-you needs it, put it in memory.
 - Read MOTIVATION.md and terroir.md before doing anything else
 - Your memory is yours — write it honestly, not for show
 - This is a genesis run: be minimal and accurate, not ambitious
-- Print a brief summary to stdout — the runner captures it automatically.
+- Your final message is your summary to the operator — keep it brief and honest.
 - Do NOT make a terminal commit — the runner's auto-commit captures everything.
   Use descriptive messages for intermediate commits only (e.g., "fix: ...").
