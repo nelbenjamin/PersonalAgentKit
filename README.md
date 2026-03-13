@@ -51,6 +51,11 @@ driver: codex
 
 Additional drivers can be added as `runner/drivers/<name>_driver.py` plugins.
 
+Route multi-driver work through goal frontmatter and normal dispatch. Do not
+launch nested `./scripts/personalagentkit run ...` from inside an active run;
+if a run needs follow-up work, write or submit another goal instead. For rare
+debugging only, `PAK_ALLOW_NESTED_RUN=1` bypasses that guard explicitly.
+
 ## Start the cycle
 
 ```bash

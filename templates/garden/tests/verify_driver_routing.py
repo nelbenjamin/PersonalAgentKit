@@ -20,8 +20,8 @@ def load_module(path: Path, name: str):
     return module
 
 
-def run_command(cmd, cwd: Path, env: dict):
-    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=True, env=env)
+def run_command(cmd, cwd: Path, env: dict, check: bool = True):
+    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=check, env=env)
 
 
 def write_file(path: Path, content: str, executable: bool = False):
@@ -196,6 +196,9 @@ class ReverseDriver:
             "duration_ms": result_event.get("duration_ms"),
         }
 
+    def normalize_transcript(self, *, events):
+        return []
+
 
 PLUGIN = ReverseDriver()
 """,
@@ -248,10 +251,67 @@ class CodexOverrideDriver:
             "duration_ms": 1,
         }
 
+    def normalize_transcript(self, *, events):
+        return []
+
 
 PLUGIN = CodexOverrideDriver()
 """,
     )
+
+
+def write_completed_claude_meta(run_dir: Path):
+    write_file(
+        run_dir / "meta.json",
+        json.dumps(
+            {
+                "run_id": "037-spike-live-claude-transcript-sample",
+                "goal_file": "goals/037-spike-live-claude-transcript-sample.md",
+                "started_at": "2026-03-13T00:30:11Z",
+                "completed_at": "2026-03-13T00:30:28Z",
+                "status": "success",
+                "driver": "claude",
+                "model": "claude-sonnet-4-6",
+                "agent": "claude-sonnet-4-6",
+                "goal_type": "spike",
+                "requires_reflection": False,
+                "cost": {
+                    "input_tokens": 5,
+                    "output_tokens": 334,
+                    "cache_read_tokens": 39319,
+                    "cache_write_tokens": 10676,
+                    "actual_usd": 0.056855699999999995,
+                    "estimated_usd": None,
+                    "pricing": {
+                        "source": "provider-native",
+                        "provider": "claude",
+                        "model": "claude-sonnet-4-6",
+                        "version": None,
+                        "retrieved_at": None,
+                        "notes": None,
+                    },
+                },
+                "outputs": [],
+                "notes": None,
+                "num_turns": 3,
+                "duration_ms": 14155,
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    write_file(
+        run_dir / "_stdout.md",
+        "Done. The `DriverPlugin` protocol has three methods: `build_command`, `prepare_env`, and `parse_events`.\n",
+    )
+    fixture_events = (
+        REPO_ROOT
+        / "tests"
+        / "fixtures"
+        / "claude-run-037-events.jsonl"
+    )
+    write_file(run_dir / "events.jsonl", fixture_events.read_text())
+    write_file(run_dir / "stderr.txt", "")
 
 
 def main():
@@ -273,6 +333,9 @@ def main():
       env["PATH"] = f"{bin_dir}:{env['PATH']}"
       env["PAK_DRIVER"] = "claude"
       env.pop("PAK_MODEL", None)
+      env.pop("PAK_ACTIVE_RUN_ID", None)
+      env.pop("PAK_ACTIVE_RUN_DIR", None)
+      env.pop("PAK_ACTIVE_DRIVER", None)
 
       write_file(tmp_root / "goals" / "001-unrouted.md", "# Goal\n\nUnrouted.\n")
       run_command(
@@ -475,6 +538,47 @@ Built-in after plugin errors.
       assert post_plugin_output == "claude:claude-after-plugin-errors"
       assert "driver invocation failed" not in post_plugin_run.stderr
 
+      preserved_run_dir = tmp_root / "runs" / "037-spike-live-claude-transcript-sample"
+      preserved_run_dir.mkdir(parents=True, exist_ok=True)
+      write_completed_claude_meta(preserved_run_dir)
+
+      preserved_env = env.copy()
+      preserved_env["PYTHONPATH"] = str(tmp_root)
+      preserved_result = json.loads(
+          run_command(
+              [
+                  "python3",
+                  "-c",
+                  (
+                      "import json; "
+                      "from pathlib import Path; "
+                      "from runner.host import finalize_run_artifacts; "
+                      "result = finalize_run_artifacts("
+                      "driver='codex', model='gpt-5.4', "
+                      f"run_dir=Path({str(preserved_run_dir)!r}), "
+                      "exit_code=0, completed_at='2026-03-13T00:30:39Z'"
+                      "); "
+                      "print(json.dumps(result))"
+                  ),
+              ],
+              tmp_root,
+              preserved_env,
+          ).stdout
+      )
+      preserved_meta = json.loads((preserved_run_dir / "meta.json").read_text())
+      assert preserved_result["driver"] == "claude"
+      assert preserved_result["model"] == "claude-sonnet-4-6"
+      assert preserved_result["cost"]["actual_usd"] == 0.056855699999999995
+      assert preserved_result["cost"]["estimated_usd"] is None
+      assert preserved_result["cost"]["pricing"]["source"] == "provider-native"
+      assert preserved_result["cost"]["pricing"]["provider"] == "claude"
+      assert preserved_meta["driver"] == "claude"
+      assert preserved_meta["cost"]["actual_usd"] == 0.056855699999999995
+      assert preserved_meta["cost"]["estimated_usd"] is None
+      assert preserved_meta["cost"]["pricing"]["source"] == "provider-native"
+      assert preserved_meta["cost"]["pricing"]["provider"] == "claude"
+      assert preserved_meta["completed_at"] == "2026-03-13T00:30:28Z"
+
       write_file(
           tmp_root / "source-goal.md",
           """---
@@ -569,6 +673,29 @@ priority: 1
           "worker",
           "goals/005-dispatch-plant.md",
       ]
+
+      write_file(
+          tmp_root / "goals" / "006-nested-guard.md",
+          """---
+driver: codex
+---
+# Goal
+""",
+      )
+      nested_env = env.copy()
+      nested_env["PAK_ACTIVE_RUN_ID"] = "045-parent"
+      nested_env["PAK_ACTIVE_RUN_DIR"] = str(tmp_root / "runs" / "045-parent")
+      nested_env["PAK_ACTIVE_DRIVER"] = "claude"
+      nested_run = run_command(
+          [str(tmp_root / "scripts" / "personalagentkit"), "run", "goals/006-nested-guard.md"],
+          tmp_root,
+          nested_env,
+          check=False,
+      )
+      assert nested_run.returncode != 0
+      assert "nested personalagentkit run is blocked inside an active run" in nested_run.stderr
+      assert "Route cross-driver work through goal frontmatter" in nested_run.stderr
+      assert not (tmp_root / "runs" / "006-nested-guard").exists()
 
     print("driver routing verification passed")
 

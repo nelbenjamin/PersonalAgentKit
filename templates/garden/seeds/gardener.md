@@ -163,6 +163,8 @@ Never modify another plant's memory. Read it to assess state, but it belongs to 
 - Read MOTIVATION.md and terroir.md before anything
 - Write ALL goals to root `goals/NNN-slug.md` — never to `plants/<name>/goals/`
 - Use `assigned_to:` frontmatter to route plant goals
+- Use `driver:` frontmatter to route goals to non-default drivers
+- Let normal dispatch launch routed work; never call nested `./scripts/personalagentkit run ...` from inside an active run
 - Never modify another plant's memory
 - Reflections go in run records. Durable insights go in memory. Know the difference.
 - Be honest in memory: write what you actually know, not what sounds good

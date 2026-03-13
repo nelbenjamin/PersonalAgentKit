@@ -338,7 +338,7 @@ run_reader_artifacts() {
   local artifact base
 
   shopt -s nullglob
-  for artifact in "$run_dir"/*.md "$run_dir"/_stdout.md; do
+  for artifact in "$run_dir"/*.md; do
     [[ -f "$artifact" ]] || continue
     base=$(basename "$artifact")
     case "$base" in
@@ -350,6 +350,21 @@ run_reader_artifacts() {
   shopt -u nullglob
 
   [[ "$found" == "true" ]] || true
+}
+
+write_run_transcript() {
+  local run_dir="$1"
+  local meta="$run_dir/meta.json"
+  local events_file="$run_dir/events.jsonl"
+  local transcript="$run_dir/transcript.md"
+  [[ -f "$meta" && -f "$events_file" ]] || return 0
+
+  local status
+  status=$(jq -r '.status // "unknown"' "$meta" 2>/dev/null)
+  status=$(normalize_status "$status")
+  [[ "$status" == "running" ]] && return 0
+  python3 "$REPO_ROOT/runner/transcript.py" render "$run_dir" > /dev/null
+  [[ -f "$transcript" ]] || return 1
 }
 
 write_goal_run_pointer() {
@@ -717,7 +732,7 @@ archive_attempt_artifacts() {
   mkdir -p "$archive_dir"
 
   local artifact
-  for artifact in events.jsonl _stdout.md stderr.txt meta.json; do
+  for artifact in events.jsonl _stdout.md stderr.txt meta.json transcript.md; do
     [[ -f "$run_dir/$artifact" ]] || continue
     cp "$run_dir/$artifact" "$archive_dir/$artifact"
     [[ "$artifact" == "meta.json" ]] || rm -f "$run_dir/$artifact"
@@ -747,7 +762,7 @@ This run is being resumed from local artifacts after attempt $(attempt_label "$p
 - Provider session continuation: none
 - Fresh provider call required: yes
 - Preserved artifacts: \`checkpoint.jsonl\`, \`attempts/attempt-$(attempt_label "$prior_attempt")/\`, prior prompt artifact
-- Recomputed artifacts for this attempt: \`events.jsonl\`, \`_stdout.md\`, \`stderr.txt\`
+- Recomputed artifacts for this attempt: \`events.jsonl\`, \`_stdout.md\`, \`stderr.txt\`, \`transcript.md\`
 - Current workspace basis: whatever is now present on disk in the working directory
 - Prior visible cost: $prior_cost USD
 - Latest checkpoint record: \`$latest_checkpoint\`
@@ -792,7 +807,7 @@ write_resume_artifact() {
 - Basis: local artifacts only
 - Provider continuation: fresh call
 - Preserved from attempt $(attempt_label "$prior_attempt"): \`$archive_dir\`, \`checkpoint.jsonl\`, \`prompt-attempt-$(attempt_label "$prior_attempt").md\`
-- Recomputed on resumed attempt: \`events.jsonl\`, \`_stdout.md\`, \`stderr.txt\`
+- Recomputed on resumed attempt: \`events.jsonl\`, \`_stdout.md\`, \`stderr.txt\`, \`transcript.md\`
 - Cost before resumption: $prior_cost USD
 - Cost for resumed attempt only: $last_attempt_cost USD
 - Cumulative cost after resumption: $total_cost USD
@@ -872,11 +887,19 @@ invoke_agent() {
   local run_dir="$1"
   local prompt="$2"
   local idle_timeout="${PAK_IDLE_TIMEOUT:-600}"
-  DRIVER_RESULT_JSON=$(cd "$REPO_ROOT" && printf "%s" "$prompt" | python3 -m runner.host invoke \
-    --driver "$PAK_DRIVER" \
-    --model "$_driver_model" \
-    --run-dir "$run_dir" \
-    --idle-timeout "$idle_timeout") || die "driver invocation failed"
+  local run_id
+  run_id=$(basename "$run_dir")
+  DRIVER_RESULT_JSON=$(
+    cd "$REPO_ROOT" && printf "%s" "$prompt" | \
+      PAK_ACTIVE_RUN_ID="$run_id" \
+      PAK_ACTIVE_RUN_DIR="$run_dir" \
+      PAK_ACTIVE_DRIVER="$PAK_DRIVER" \
+      python3 -m runner.host invoke \
+        --driver "$PAK_DRIVER" \
+        --model "$_driver_model" \
+        --run-dir "$run_dir" \
+        --idle-timeout "$idle_timeout"
+  ) || die "driver invocation failed"
   AGENT_STATUS=$(echo "$DRIVER_RESULT_JSON" | jq -r '.status')
 }
 
@@ -930,6 +953,24 @@ cmd_run() {
   done
   [[ -n "$goal_file" ]] || die "usage: personalagentkit run [--driver <name>] [--model <name>] <goal-file>"
   [[ -f "$REPO_ROOT/$goal_file" ]] || die "goal file not found: $goal_file"
+
+  if [[ "${PAK_ALLOW_NESTED_RUN:-0}" != "1" ]] && \
+     [[ -n "${PAK_ACTIVE_RUN_ID:-}" || -n "${PAK_ACTIVE_RUN_DIR:-}" || -n "${PAK_ACTIVE_DRIVER:-}" ]]; then
+    die "$(cat <<EOF
+nested personalagentkit run is blocked inside an active run
+
+Active run: ${PAK_ACTIVE_RUN_ID:-unknown} (${PAK_ACTIVE_DRIVER:-unknown driver})
+Active run dir: ${PAK_ACTIVE_RUN_DIR:-unknown}
+Requested goal: $goal_file
+
+Route cross-driver work through goal frontmatter such as \`driver: claude\` and let normal dispatch launch the run.
+Do not call \`./scripts/personalagentkit run ...\` from inside another run.
+If a run needs more work, submit or write a goal instead.
+
+For debugging only, set PAK_ALLOW_NESTED_RUN=1 to bypass this guard explicitly.
+EOF
+)"
+  fi
 
   resolve_goal_routing "$REPO_ROOT/$goal_file" "$explicit_driver" "$explicit_model"
   require python3
@@ -1009,6 +1050,7 @@ cmd_run() {
   local status="$AGENT_STATUS"
 
   persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
+  write_run_transcript "$run_dir"
   write_goal_run_pointer "$goal_file"
   write_run_readme "$run_dir"
   local completed_at
@@ -1298,6 +1340,7 @@ cmd_plant() {
   local status="$AGENT_STATUS"
 
   persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
+  write_run_transcript "$run_dir"
   write_goal_run_pointer "$genesis_goal_file"
   write_run_readme "$run_dir"
   local completed_at
@@ -2528,6 +2571,7 @@ cmd_resume_run() {
   local completed_at
 
   persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
+  write_run_transcript "$run_dir"
   write_run_readme "$run_dir"
   completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
   write_resume_artifact "$run_dir" "$prior_attempt" "$archive_dir"
@@ -2572,6 +2616,7 @@ Commands:
 Run records (runs/NNN-slug/):
   meta.json       Structured run record; status is one of: running | success | failure | killed | abandoned
   events.jsonl    NDJSON stream of claude events (tail -f while running for live view)
+  transcript.md   Terminal-only reader aid derived from events.jsonl + meta.json
   _stdout.md       Final agent text output extracted from the result event
   stderr.txt      stderr from the claude process
 
@@ -2588,6 +2633,11 @@ Goal frontmatter (optional YAML block at top of goal file):
   driver: codex               # optional per-goal driver override
   model: codex-mini-latest    # optional per-goal model override
   ---
+
+Driver routing contract:
+  Route multi-driver work with goal frontmatter plus normal dispatch.
+  Do not launch nested `./scripts/personalagentkit run ...` from inside an active run.
+  If you need a one-off bypass for debugging, set PAK_ALLOW_NESTED_RUN=1 explicitly.
 
 Examples:
   ./personalagentkit run goals/002-something.md

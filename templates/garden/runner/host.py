@@ -184,6 +184,20 @@ def has_terminal_event(events: list[dict[str, Any]]) -> bool:
     return False
 
 
+def normalize_status(status: Any) -> str | None:
+    if status == "completed":
+        return "success"
+    if status == "failed":
+        return "failure"
+    if isinstance(status, str) and status:
+        return status
+    return None
+
+
+def is_terminal_status(status: Any) -> bool:
+    return normalize_status(status) in {"success", "failure", "killed", "abandoned"}
+
+
 def enrich_normalized_result(result: dict[str, Any]) -> dict[str, Any]:
     cost = dict(result.get("cost") or {})
     pricing = dict(cost.get("pricing") or {})
@@ -216,6 +230,14 @@ def write_run_output(*, run_dir: Path, output: str) -> Path:
     output_path = run_dir / "_stdout.md"
     output_path.write_text(f"{output}\n", encoding="utf-8")
     return output_path
+
+
+def read_run_output(*, run_dir: Path) -> str:
+    output_path = run_dir / "_stdout.md"
+    if not output_path.exists():
+        return "no output"
+    output = output_path.read_text(encoding="utf-8").strip()
+    return output or "no output"
 
 
 def checkpoint_path(*, run_dir: Path) -> Path:
@@ -321,6 +343,38 @@ def finalize_run_artifacts(
     if plugin is None:
         supported = ", ".join(sorted(plugins))
         raise SystemExit(f"unknown driver: {driver} (supported: {supported})")
+
+    meta_path = run_dir / "meta.json"
+    if forced_status is None and meta_path.exists():
+        try:
+            existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing_meta = None
+        if isinstance(existing_meta, dict) and is_terminal_status(existing_meta.get("status")):
+            persisted_driver = str(existing_meta.get("driver") or plugin.config.name)
+            persisted_plugin = plugins.get(persisted_driver, plugin)
+            normalized = enrich_normalized_result(
+                {
+                    "output": read_run_output(run_dir=run_dir),
+                    "cost": existing_meta.get("cost"),
+                    "num_turns": existing_meta.get("num_turns"),
+                    "duration_ms": existing_meta.get("duration_ms"),
+                }
+            )
+            normalized.update(
+                {
+                    "status": normalize_status(existing_meta.get("status")) or "success",
+                    "driver": persisted_driver,
+                    "model": str(existing_meta.get("model") or model),
+                    "binary": persisted_plugin.config.binary,
+                    "output_path": str(run_dir / "_stdout.md"),
+                    "events_path": str(run_dir / "events.jsonl"),
+                    "stderr_path": str(run_dir / "stderr.txt"),
+                }
+            )
+            if "notes" in existing_meta:
+                normalized["notes"] = existing_meta.get("notes")
+            return normalized
 
     events_path = run_dir / "events.jsonl"
     events = parse_events(events_path)

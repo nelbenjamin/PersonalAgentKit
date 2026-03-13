@@ -113,13 +113,32 @@ class AgentmailHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         state = self.server.state
 
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length) if length else b"{}"
+        payload = json.loads(raw_body.decode() or "{}")
+
+        for inbox in state["inboxes"]:
+            inbox_id = inbox["inbox_id"]
+            inbox_path = f"/v0/inboxes/{urllib.parse.quote(inbox_id, safe='@')}"
+            if parsed.path == f"{inbox_path}/messages/send":
+                state["sent_messages"].append(
+                    {
+                        "inbox_id": inbox_id,
+                        "payload": payload,
+                    }
+                )
+                self._send_json(
+                    {
+                        "message_id": f"<sent-{len(state['sent_messages'])}@example.com>",
+                        "thread_id": f"thread-sent-{len(state['sent_messages'])}",
+                    }
+                )
+                return
+
         if parsed.path != "/v0/inboxes":
             self.send_error(404)
             return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(length) if length else b"{}"
-        payload = json.loads(raw_body.decode() or "{}")
         client_id = payload.get("client_id")
         if state.get("create_status") is not None:
             self.send_error(state["create_status"])
@@ -237,6 +256,7 @@ class AgentmailServer(ThreadingHTTPServer):
             },
             "create_requests": [],
             "create_status": None,
+            "sent_messages": [],
         }
 
 
@@ -691,6 +711,115 @@ fi
             inbox_text = inbox_files[0].read_text()
             assert "message_id: \"<message-2@example.com>\"" in inbox_text
             assert "override detail" in inbox_text
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            scaffold_agentmail_repo(repo_root)
+            write_file(repo_root / "secrets" / "agentmail-api-key.txt", "test-key\n")
+            write_file(repo_root / "memory" / "MEMORY.md", "I am Cipher.\n")
+            write_file(
+                repo_root / "config" / "agentmail.env",
+                "export AGENTMAIL_INBOX_ID=pak-shared@agentmail.to\n",
+            )
+
+            dispatcher = dispatch.Dispatcher(
+                repo_root=repo_root,
+                max_workers=1,
+                tend_interval=30,
+                max_cost=None,
+                retro_interval=3600,
+            )
+            dispatcher._last_completed_run = {
+                "run_id": "023-build-idle-operator-email",
+                "status": "success",
+                "completed_at": "2026-03-12T22:30:00Z",
+                "goal_title": "Build Idle Operator Email",
+            }
+
+            sent_before = len(agentmail_server.state["sent_messages"])
+            old_base_url = os.environ.get("AGENTMAIL_BASE_URL")
+            os.environ["AGENTMAIL_BASE_URL"] = agentmail_base_url
+            try:
+                sent = dispatcher._send_idle_operator_email()
+            finally:
+                if old_base_url is None:
+                    os.environ.pop("AGENTMAIL_BASE_URL", None)
+                else:
+                    os.environ["AGENTMAIL_BASE_URL"] = old_base_url
+            assert_equal(sent, True, "idle-email should send through the existing Agentmail transport")
+            sent_after = len(agentmail_server.state["sent_messages"])
+            assert_equal(sent_after, sent_before + 1, "idle-email should emit exactly one Agentmail send request")
+            payload = agentmail_server.state["sent_messages"][-1]["payload"]
+            assert_equal(payload["to"], ["operator@example.com"], "idle-email should target the operator email from the charter")
+            assert_equal(
+                payload["subject"],
+                f"[{repo_root.name}] system idle",
+                "idle-email should use a human-readable idle-status subject",
+            )
+            assert "023-build-idle-operator-email (success)" in payload["text"]
+            assert "Build Idle Operator Email" in payload["text"]
+            assert "The system is idle." in payload["text"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            scaffold_agentmail_repo(repo_root)
+
+            dispatcher = dispatch.Dispatcher(
+                repo_root=repo_root,
+                max_workers=1,
+                tend_interval=30,
+                max_cost=None,
+                retro_interval=3600,
+            )
+
+            send_calls: list[str] = []
+
+            def fake_send() -> bool:
+                send_calls.append(dispatcher._last_completed_run["run_id"])
+                return True
+
+            dispatcher._send_idle_operator_email = fake_send
+            assert_equal(
+                dispatcher._maybe_send_idle_operator_email(),
+                False,
+                "idle-email should not send before any completion is recorded",
+            )
+
+            dispatcher._last_completed_run = {
+                "run_id": "010-first",
+                "status": "success",
+                "completed_at": "2026-03-12T22:00:00Z",
+                "goal_title": "First",
+            }
+            dispatcher._idle_notification_pending = True
+            assert_equal(
+                dispatcher._maybe_send_idle_operator_email(),
+                True,
+                "idle-email should send once when the queue first transitions to idle after a completion",
+            )
+            assert_equal(
+                dispatcher._maybe_send_idle_operator_email(),
+                False,
+                "idle-email should not resend while the system remains idle for the same completion",
+            )
+
+            dispatcher._last_completed_run = {
+                "run_id": "011-second",
+                "status": "failure",
+                "completed_at": "2026-03-12T22:10:00Z",
+                "goal_title": "Second",
+            }
+            dispatcher._idle_notification_pending = True
+            assert_equal(
+                dispatcher._maybe_send_idle_operator_email(),
+                True,
+                "idle-email should re-arm only after a newer completion occurs",
+            )
+            assert_equal(
+                send_calls,
+                ["010-first", "011-second"],
+                "idle-email dedupe should key off the most recent completed run",
+            )
     finally:
         agentmail_server.shutdown()
         agentmail_server.server_close()

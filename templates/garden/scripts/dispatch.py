@@ -19,6 +19,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +69,32 @@ def operator_first_name(repo_root: Path) -> str | None:
         first_token = stripped.split()[0].strip().lower()
         normalized = re.sub(r"[^a-z0-9-]", "", first_token)
         return normalized or None
+    return None
+
+
+def operator_email(repo_root: Path) -> str | None:
+    charter_path = repo_root.parent / "shared" / "charter.md"
+    if not charter_path.is_file():
+        return None
+
+    try:
+        lines = charter_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    in_operator_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "## Operator":
+            in_operator_section = True
+            continue
+        if in_operator_section and stripped.startswith("## "):
+            break
+        if not in_operator_section:
+            continue
+        match = re.match(r"^Email:\s*(\S+)\s*$", stripped, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
     return None
 
 
@@ -212,6 +241,9 @@ class Dispatcher:
         self._startup_gardener_run_id: Optional[str] = None
         self._hook_last_run: dict[str, float] = {}
         self._hook_poll_lock = threading.Lock()
+        self._last_completed_run: dict[str, str] | None = None
+        self._idle_notification_pending = False
+        self._idle_notification_handled_run_id: str | None = None
 
         if _reconcile_orphaned_runs is not None:
             for result in _reconcile_orphaned_runs(self.repo_root):
@@ -760,6 +792,185 @@ class Dispatcher:
             return False
         return age_seconds < idle_timeout
 
+    def _goal_title_for_run(self, run_dir: Path, meta: dict) -> str:
+        goal_file = meta.get("goal_file")
+        if not isinstance(goal_file, str) or not goal_file.strip():
+            return run_dir.name
+        goal_path = self.repo_root / goal_file
+        if not goal_path.is_file():
+            return run_dir.name
+        try:
+            for line in goal_path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    return stripped.lstrip("#").strip() or run_dir.name
+        except OSError:
+            return run_dir.name
+        return run_dir.name
+
+    def _record_run_completion(self, run_dir: Path) -> None:
+        meta_path = run_dir / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+
+        status = normalize_run_status(meta.get("status")) or "unknown"
+        summary = {
+            "run_id": run_dir.name,
+            "status": status,
+            "completed_at": str(meta.get("completed_at") or ""),
+            "goal_title": self._goal_title_for_run(run_dir, meta),
+        }
+        with self.lock:
+            self._last_completed_run = summary
+            self._idle_notification_pending = True
+
+    def _load_agentmail_inbox_id(self) -> str | None:
+        inbox_id = os.environ.get("AGENTMAIL_INBOX_ID", "").strip()
+        if inbox_id:
+            return inbox_id
+
+        config_path = self.repo_root / "config" / "agentmail.env"
+        if not config_path.is_file():
+            return None
+
+        try:
+            lines = config_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = re.match(r"^(?:export\s+)?AGENTMAIL_INBOX_ID=(.+)$", stripped)
+            if not match:
+                continue
+            value = match.group(1).strip().strip("'\"")
+            if value:
+                return value
+        return None
+
+    def _ensure_agentmail_inbox_id(self) -> str | None:
+        inbox_id = self._load_agentmail_inbox_id()
+        if inbox_id:
+            return inbox_id
+
+        setup_script = self.repo_root / "hooks" / "setup-agentmail.sh"
+        if not setup_script.is_file() or not os.access(setup_script, os.X_OK):
+            return None
+
+        try:
+            result = subprocess.run(
+                [str(setup_script)],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=os.environ.copy(),
+            )
+        except Exception as exc:
+            print(f"personalagentkit: idle-email setup failed (non-fatal): {exc}", flush=True)
+            return None
+
+        for line in result.stdout.splitlines():
+            if line.strip():
+                print(f"personalagentkit: idle-email setup: {line}", flush=True)
+        for line in result.stderr.splitlines():
+            if line.strip():
+                print(f"personalagentkit: idle-email setup stderr: {line}", flush=True)
+
+        return self._load_agentmail_inbox_id()
+
+    def _send_idle_operator_email(self) -> bool:
+        summary = self._last_completed_run
+        if not summary:
+            return False
+
+        recipient = operator_email(self.repo_root)
+        if not recipient:
+            print("personalagentkit: idle-email skipped — operator email not found", flush=True)
+            return False
+
+        api_key_file = self.repo_root / "secrets" / "agentmail-api-key.txt"
+        if not api_key_file.is_file():
+            print("personalagentkit: idle-email skipped — missing Agentmail API key", flush=True)
+            return False
+
+        try:
+            api_key = api_key_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"personalagentkit: idle-email skipped — could not read API key: {exc}", flush=True)
+            return False
+        if not api_key:
+            print("personalagentkit: idle-email skipped — empty Agentmail API key", flush=True)
+            return False
+
+        inbox_id = self._ensure_agentmail_inbox_id()
+        if not inbox_id:
+            print("personalagentkit: idle-email skipped — no Agentmail inbox id available", flush=True)
+            return False
+
+        garden_name = self.repo_root.name
+        title = summary.get("goal_title") or summary["run_id"]
+        completed_at = summary.get("completed_at") or "unknown time"
+        subject = f"[{garden_name}] system idle"
+        body = (
+            "Gabriel,\n\n"
+            "The system is idle. The queue is empty and there is nothing left to do right now.\n\n"
+            f"Last completed run: {summary['run_id']} ({summary['status']})\n"
+            f"Title: {title}\n"
+            f"Completed at: {completed_at}\n"
+        )
+        payload = {
+            "to": [recipient],
+            "subject": subject,
+            "text": body,
+        }
+        base_url = os.environ.get("AGENTMAIL_BASE_URL", "https://api.agentmail.to/v0").rstrip("/")
+        url = f"{base_url}/inboxes/{urllib.parse.quote(inbox_id, safe='@')}/messages/send"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            print(f"personalagentkit: idle-email failed with HTTP {exc.code}", flush=True)
+            return False
+        except Exception as exc:
+            print(f"personalagentkit: idle-email failed (non-fatal): {exc}", flush=True)
+            return False
+
+        print(
+            f"personalagentkit: idle-email sent for {summary['run_id']} to {recipient}",
+            flush=True,
+        )
+        return True
+
+    def _maybe_send_idle_operator_email(self) -> bool:
+        with self.lock:
+            summary = dict(self._last_completed_run) if self._last_completed_run else None
+            pending = self._idle_notification_pending
+            handled_run_id = self._idle_notification_handled_run_id
+
+        if not summary or not pending or handled_run_id == summary["run_id"]:
+            return False
+
+        self._send_idle_operator_email()
+        with self.lock:
+            self._idle_notification_pending = False
+            self._idle_notification_handled_run_id = summary["run_id"]
+        return True
+
     def _recover_stale_run(self, run_dir: Path, meta: dict) -> bool:
         driver = meta.get("driver")
         model = meta.get("model")
@@ -907,11 +1118,19 @@ class Dispatcher:
                     pass
 
         finally:
+            goal_id = Path(goal_rel).stem
+            run_dir = (
+                self.repo_root / "plants" / assigned_to / "runs" / goal_id
+                if assigned_to
+                else self.repo_root / "runs" / goal_id
+            )
             with self.lock:
                 self.active_slots -= 1
                 self.in_progress.discard(goal_rel)
-                self._mark_plant_inactive_locked(assigned_to, Path(goal_rel).stem)
+                self._mark_plant_inactive_locked(assigned_to, goal_id)
                 self._recent_completions += 1
+            if run_dir.is_dir():
+                self._record_run_completion(run_dir)
             self.slot_freed.set()
 
     # ── restored-run monitor thread ───────────────────────────────────────────
@@ -928,6 +1147,9 @@ class Dispatcher:
                         self.active_slots -= 1
                         self.in_progress.discard(goal_rel)
                         self._mark_plant_inactive_locked(plant_name, run_id)
+                    run_dir = self.repo_root / "plants" / plant_name / "runs" / run_id
+                    if run_dir.is_dir():
+                        self._record_run_completion(run_dir)
                     self.slot_freed.set()
                     print(
                         f"personalagentkit: startup-restored run {run_id} ({plant_name})"
@@ -1349,6 +1571,7 @@ class Dispatcher:
                     # periodically, and let the gardener try again on schedule.
                     # If email arrives, trigger an immediate tend so Vigil can
                     # read and respond without waiting for the full interval.
+                    self._maybe_send_idle_operator_email()
                     self._poll_inbox()
                     print(
                         f"personalagentkit: queue empty after tend — idling "
